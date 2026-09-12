@@ -69,12 +69,21 @@ public final class WhiteboardToolbarDelegate: NSObject, NSToolbarDelegate {
     }
 }
 
+// MARK: - Window Mode: Gallery (Freeform Browser) vs Board (Canvas)
+public enum WhiteboardWindowMode {
+    case gallery
+    case board
+}
+
 // MARK: - Native macOS Tahoe 26 Whiteboard Window
 public final class WhiteboardWindow: NSWindow {
+    public let rootContainerView: NSView
     public let canvasView: WhiteboardCanvasView
+    public var currentMode: WhiteboardWindowMode = .gallery
     private var toolbarDelegate: WhiteboardToolbarDelegate?
 
-    public init(canvasView: WhiteboardCanvasView, initialRect: NSRect) {
+    public init(rootContainerView: NSView, canvasView: WhiteboardCanvasView, initialRect: NSRect) {
+        self.rootContainerView = rootContainerView
         self.canvasView = canvasView
 
         super.init(
@@ -109,7 +118,7 @@ public final class WhiteboardWindow: NSWindow {
         toolbar.displayMode = .iconOnly
         self.toolbar = toolbar
 
-        contentView = canvasView
+        contentView = rootContainerView
         setFrameAutosaveName("HiramekiFreeformWhiteboardWindow")
     }
 
@@ -129,47 +138,47 @@ public final class WhiteboardWindow: NSWindow {
                 miniaturize(nil)
                 return true
             }
-            if chars == "0" {
+            if chars == "n" {
+                if let ctrl = windowController as? WhiteboardWindowController {
+                    ctrl.createNewBoard()
+                } else {
+                    canvasView.freeformDidRequestNewBoard()
+                }
+                return true
+            }
+            if chars == "0" && currentMode == .board {
                 canvasView.resetZoom()
                 return true
             }
-            if chars == "=" || chars == "+" {
+            if (chars == "=" || chars == "+") && currentMode == .board {
                 canvasView.zoomIn()
                 return true
             }
-            if chars == "-" {
+            if chars == "-" && currentMode == .board {
                 canvasView.zoomOut()
                 return true
             }
-            if chars == "s" {
-                if event.modifierFlags.contains(.shift) {
-                    canvasView.freeformDidRequestSaveBoardAs()
-                } else {
-                    canvasView.freeformDidRequestSaveBoard()
-                }
+            if chars == "s" && currentMode == .board {
+                BoardManager.shared.flushPendingAutoSave()
                 return true
             }
             if chars == "o" {
                 canvasView.freeformDidRequestOpenBoard()
                 return true
             }
-            if chars == "n" {
-                canvasView.freeformDidRequestNewBoard()
-                return true
-            }
-            if chars == "e" {
+            if chars == "e" && currentMode == .board {
                 canvasView.freeformDidRequestExportPDF()
                 return true
             }
-            if chars == "i" {
+            if chars == "i" && currentMode == .board {
                 canvasView.freeformDidRequestInsertPDF()
                 return true
             }
-            if chars == "u" {
+            if chars == "u" && currentMode == .board {
                 canvasView.freeformDidRequestInsertImage()
                 return true
             }
-            if chars == "z" {
+            if chars == "z" && currentMode == .board {
                 if event.modifierFlags.contains(.shift) {
                     canvasView.redo()
                 } else {
@@ -177,7 +186,7 @@ public final class WhiteboardWindow: NSWindow {
                 }
                 return true
             }
-            if chars == "k" {
+            if chars == "k" && currentMode == .board {
                 canvasView.clearAll()
                 return true
             }
@@ -188,10 +197,13 @@ public final class WhiteboardWindow: NSWindow {
 
 // MARK: - Main Whiteboard Window Controller
 public final class WhiteboardWindowController: NSWindowController, NSWindowDelegate, WhiteboardCanvasDelegate {
+    public var mode: WhiteboardWindowMode = .gallery
+    public var rootContainerView: NSView!
+    public var galleryHostingView: NSView!
     public var canvasView: WhiteboardCanvasView!
     public var whiteboardWindow: WhiteboardWindow!
 
-    public init(document: WhiteboardDocument = WhiteboardDocument()) {
+    public init(document: WhiteboardDocument? = nil, initialMode: WhiteboardWindowMode? = nil) {
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 100, y: 100, width: 1280, height: 820)
         let width = min(1280, screenFrame.width - 80)
         let height = min(820, screenFrame.height - 80)
@@ -202,34 +214,115 @@ public final class WhiteboardWindowController: NSWindowController, NSWindowDeleg
             height: height
         )
 
-        let canvas = WhiteboardCanvasView(frame: NSRect(origin: .zero, size: initialRect.size), document: document)
-        let win = WhiteboardWindow(canvasView: canvas, initialRect: initialRect)
+        let rootContainer = NSView(frame: NSRect(origin: .zero, size: initialRect.size))
+        rootContainer.autoresizingMask = [.width, .height]
+        self.rootContainerView = rootContainer
+
+        let doc = document ?? WhiteboardDocument()
+        let canvas = WhiteboardCanvasView(frame: NSRect(origin: .zero, size: initialRect.size), document: doc)
+        canvas.autoresizingMask = [.width, .height]
+        self.canvasView = canvas
+
+        let win = WhiteboardWindow(rootContainerView: rootContainer, canvasView: canvas, initialRect: initialRect)
+        self.whiteboardWindow = win
 
         super.init(window: win)
 
-        self.canvasView = canvas
-        self.whiteboardWindow = win
         win.delegate = self
         canvas.canvasDelegate = self
 
-        updateWindowTitle()
+        // Setup Freeform Gallery hosting view
+        let galleryView = BoardsGalleryView(
+            onOpenBoard: { [weak self] item in
+                self?.openBoard(item: item)
+            },
+            onNewBoard: { [weak self] in
+                self?.createNewBoard()
+            }
+        )
+        let galleryHost = NSHostingView(rootView: galleryView)
+        galleryHost.autoresizingMask = [.width, .height]
+        galleryHost.frame = rootContainer.bounds
+        self.galleryHostingView = galleryHost
+
+        let resolvedMode: WhiteboardWindowMode
+        if let explicit = initialMode {
+            resolvedMode = explicit
+        } else if document != nil {
+            resolvedMode = .board
+        } else {
+            resolvedMode = .gallery
+        }
+
+        setMode(resolvedMode)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
+    public func setMode(_ newMode: WhiteboardWindowMode) {
+        self.mode = newMode
+        whiteboardWindow.currentMode = newMode
+
+        if newMode == .gallery {
+            BoardManager.shared.flushPendingAutoSave()
+            canvasView.removeFromSuperview()
+            if galleryHostingView.superview == nil {
+                rootContainerView.addSubview(galleryHostingView)
+            }
+            galleryHostingView.frame = rootContainerView.bounds
+            whiteboardWindow.toolbar?.isVisible = false
+            whiteboardWindow.title = "Hirameki Whiteboard"
+            BoardManager.shared.reloadBoards()
+        } else {
+            galleryHostingView.removeFromSuperview()
+            if canvasView.superview == nil {
+                rootContainerView.addSubview(canvasView)
+            }
+            canvasView.frame = rootContainerView.bounds
+            whiteboardWindow.toolbar?.isVisible = true
+            whiteboardWindow.makeFirstResponder(canvasView)
+            updateWindowTitle()
+        }
+    }
+
+    public func openBoard(item: BoardItem) {
+        if let doc = try? WhiteboardDocument.load(from: item.fileURL) {
+            openBoard(document: doc)
+        }
+    }
+
+    public func openBoard(document: WhiteboardDocument) {
+        BoardManager.shared.flushPendingAutoSave()
+        canvasView.loadDocument(document)
+        BoardManager.shared.currentBoardID = document.id
+        setMode(.board)
+    }
+
+    public func createNewBoard() {
+        BoardManager.shared.flushPendingAutoSave()
+        let doc = BoardManager.shared.createNewBoard()
+        openBoard(document: doc)
+    }
+
     public func updateWindowTitle() {
         guard let canvas = canvasView, let win = whiteboardWindow else { return }
-        let pageName = canvas.document.activePage.name
-        let docTitle = canvas.document.title
-        win.title = "\(docTitle) — \(pageName)"
+        let targetTitle: String
+        if mode == .board {
+            let pageName = canvas.document.activePage.name
+            let docTitle = canvas.document.title
+            targetTitle = "\(docTitle) — \(pageName)"
+        } else {
+            targetTitle = "Hirameki Whiteboard"
+        }
+        if win.title != targetTitle {
+            win.title = targetTitle
+        }
     }
 
     public func windowWillClose(_ notification: Notification) {
-        if let fileURL = canvasView.document.fileURL {
-            try? canvasView.document.save(to: fileURL)
-        }
+        BoardManager.shared.flushPendingAutoSave()
     }
 
     // MARK: - File Dialogs
@@ -282,12 +375,11 @@ public final class WhiteboardWindowController: NSWindowController, NSWindowDeleg
         panel.message = "Choose a Hirameki Whiteboard file to open"
 
         guard let win = whiteboardWindow else { return }
-        panel.beginSheetModal(for: win) { response in
+        panel.beginSheetModal(for: win) { [weak self] response in
             if response == .OK, let url = panel.url {
                 do {
                     let doc = try WhiteboardDocument.load(from: url)
-                    let newCtrl = WhiteboardAppDelegate.shared.createBoard(document: doc)
-                    newCtrl.showWindow(nil)
+                    self?.openBoard(document: doc)
                 } catch {
                     let alert = NSAlert(error: error)
                     alert.runModal()
@@ -351,6 +443,7 @@ public final class WhiteboardWindowController: NSWindowController, NSWindowDeleg
 
     // MARK: - WhiteboardCanvasDelegate
     public func canvasDidUpdateDocument(_ doc: WhiteboardDocument) {
+        BoardManager.shared.autoSave(document: doc)
         updateWindowTitle()
     }
 
@@ -383,8 +476,17 @@ public final class WhiteboardWindowController: NSWindowController, NSWindowDeleg
     }
 
     public func canvasDidRequestNewBoard() {
-        let newCtrl = WhiteboardAppDelegate.shared.createBoard()
-        newCtrl.showWindow(nil)
+        createNewBoard()
+    }
+
+    public func canvasDidRequestReturnToGallery() {
+        setMode(.gallery)
+    }
+
+    public func canvasDidRequestSwitchBoard(id: UUID) {
+        if let item = BoardManager.shared.boards.first(where: { $0.id == id }) {
+            openBoard(item: item)
+        }
     }
 }
 
@@ -418,14 +520,14 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         if !openedAny && windowControllers.isEmpty {
-            createBoard()
+            showGallery()
         }
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
     public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            createBoard()
+            showGallery()
         }
         return true
     }
@@ -441,8 +543,9 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
         let ext = url.pathExtension.lowercased()
         if ext == "pdf" {
             let winCtrl: WhiteboardWindowController
-            if let first = windowControllers.first, first.canvasView.document.activePage.strokes.isEmpty && first.canvasView.document.activePage.embeddedPDFs.isEmpty && first.canvasView.document.activePage.embeddedImages.isEmpty {
+            if let first = windowControllers.first {
                 winCtrl = first
+                winCtrl.openBoard(document: WhiteboardDocument())
             } else {
                 winCtrl = createBoard()
             }
@@ -453,8 +556,9 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
 
         if ["png", "jpg", "jpeg", "gif", "tiff", "tif", "webp", "heic", "bmp"].contains(ext) {
             let winCtrl: WhiteboardWindowController
-            if let first = windowControllers.first, first.canvasView.document.activePage.strokes.isEmpty && first.canvasView.document.activePage.embeddedPDFs.isEmpty && first.canvasView.document.activePage.embeddedImages.isEmpty {
+            if let first = windowControllers.first {
                 winCtrl = first
+                winCtrl.openBoard(document: WhiteboardDocument())
             } else {
                 winCtrl = createBoard()
             }
@@ -465,6 +569,11 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             let doc = try WhiteboardDocument.load(from: url)
+            if let existing = windowControllers.first {
+                existing.openBoard(document: doc)
+                existing.whiteboardWindow.makeKeyAndOrderFront(nil)
+                return true
+            }
             let winCtrl = createBoard(document: doc)
             winCtrl.showWindow(self)
             return true
@@ -476,8 +585,29 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @discardableResult
+    public func showGallery() -> WhiteboardWindowController {
+        if let first = windowControllers.first {
+            first.setMode(.gallery)
+            first.whiteboardWindow.makeKeyAndOrderFront(nil)
+            return first
+        }
+        let winCtrl = WhiteboardWindowController(initialMode: .gallery)
+        windowControllers.append(winCtrl)
+        winCtrl.showWindow(self)
+        winCtrl.whiteboardWindow.center()
+        winCtrl.whiteboardWindow.makeKeyAndOrderFront(nil)
+        winCtrl.whiteboardWindow.orderFrontRegardless()
+        return winCtrl
+    }
+
+    @discardableResult
     public func createBoard(document: WhiteboardDocument = WhiteboardDocument()) -> WhiteboardWindowController {
-        let winCtrl = WhiteboardWindowController(document: document)
+        if let first = windowControllers.first {
+            first.openBoard(document: document)
+            first.whiteboardWindow.makeKeyAndOrderFront(nil)
+            return first
+        }
+        let winCtrl = WhiteboardWindowController(document: document, initialMode: .board)
         windowControllers.append(winCtrl)
         winCtrl.showWindow(self)
         winCtrl.whiteboardWindow.center()

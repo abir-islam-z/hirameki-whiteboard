@@ -25,6 +25,13 @@ public protocol FreeformWhiteboardActionDelegate: AnyObject {
     func freeformDidResetZoom()
     func freeformDidSetZoom(_ scale: CGFloat)
     func freeformDidZoomToFit()
+    func freeformDidRequestReturnToGallery()
+    func freeformDidRequestSwitchBoard(id: UUID)
+}
+
+public extension FreeformWhiteboardActionDelegate {
+    func freeformDidRequestReturnToGallery() {}
+    func freeformDidRequestSwitchBoard(id: UUID) {}
 }
 
 public enum EraserType: String, CaseIterable, Codable {
@@ -77,13 +84,272 @@ public final class FreeformWhiteboardState: ObservableObject {
     }
 }
 
-// MARK: - 1. Top-Left: Document Title Pill with Folder & Actions Menu
+// MARK: - Freeform Boards List Popover (Presented from < Boards back button)
+public struct BoardsListPopoverView: View {
+    @ObservedObject public var boardManager: BoardManager
+    public let currentBoardTitle: String
+    public var onSelectBoard: (UUID) -> Void
+    public var onReturnToGallery: () -> Void
+    public var onNewBoard: () -> Void
+
+    @State private var search: String = ""
+    @State private var hoveredBoardID: UUID?
+
+    public init(
+        boardManager: BoardManager,
+        currentBoardTitle: String,
+        onSelectBoard: @escaping (UUID) -> Void,
+        onReturnToGallery: @escaping () -> Void,
+        onNewBoard: @escaping () -> Void
+    ) {
+        self.boardManager = boardManager
+        self.currentBoardTitle = currentBoardTitle
+        self.onSelectBoard = onSelectBoard
+        self.onReturnToGallery = onReturnToGallery
+        self.onNewBoard = onNewBoard
+    }
+
+    private var filtered: [BoardItem] {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if q.isEmpty {
+            return Array(boardManager.boards.prefix(12))
+        }
+        return boardManager.boards.filter { $0.title.lowercased().contains(q) }
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // 1. Top Action: Return to Gallery
+            Button(action: onReturnToGallery) {
+                HStack(spacing: 8) {
+                    Image(systemName: "square.grid.2x2.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.accentColor)
+                        .frame(width: 24, height: 24)
+                        .background(Color.accentColor.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("All Boards")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.primary)
+                        Text("Browse, search and manage all boards")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+
+                    Spacer()
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary.opacity(0.6))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Divider()
+                .padding(.horizontal, 8)
+
+            // 2. Search Field
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.secondary)
+                TextField("Search boards...", text: $search)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11))
+                if !search.isEmpty {
+                    Button {
+                        search = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color.primary.opacity(0.04))
+            .cornerRadius(6)
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
+
+            // 3. Section Header
+            HStack {
+                Text(search.isEmpty ? "RECENT BOARDS" : "SEARCH RESULTS")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.secondary)
+                    .tracking(0.5)
+
+                Spacer()
+
+                Button {
+                    onNewBoard()
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 9, weight: .bold))
+                        Text("New Board")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundColor(.accentColor)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 6)
+            .padding(.bottom, 4)
+
+            // 4. Boards List
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    if filtered.isEmpty {
+                        VStack(spacing: 6) {
+                            Image(systemName: "doc.text.magnifyingglass")
+                                .font(.system(size: 20))
+                                .foregroundColor(.secondary.opacity(0.6))
+                            Text("No boards found")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 100)
+                    } else {
+                        ForEach(filtered) { item in
+                            let isCurrent = (item.title == currentBoardTitle || item.id == boardManager.currentBoardID)
+                            let isHovered = hoveredBoardID == item.id
+
+                            Button {
+                                onSelectBoard(item.id)
+                            } label: {
+                                HStack(spacing: 8) {
+                                    // Mini thumbnail or icon
+                                    boardMiniThumbnail(for: item)
+                                        .frame(width: 36, height: 26)
+                                        .cornerRadius(4)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 4)
+                                                .stroke(Color.primary.opacity(0.12), lineWidth: 0.5)
+                                        )
+
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(item.title)
+                                            .font(.system(size: 12, weight: isCurrent ? .bold : .medium))
+                                            .foregroundColor(.primary)
+                                            .lineLimit(1)
+
+                                        Text(formatDate(item.modifiedAt))
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.secondary)
+                                    }
+
+                                    Spacer()
+
+                                    if isCurrent {
+                                        Image(systemName: "checkmark")
+                                            .font(.system(size: 11, weight: .bold))
+                                            .foregroundColor(.accentColor)
+                                    }
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(
+                                    isHovered
+                                        ? Color.accentColor.opacity(0.12)
+                                        : (isCurrent ? Color.primary.opacity(0.04) : Color.clear)
+                                )
+                                .cornerRadius(6)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .onHover { h in
+                                if h { hoveredBoardID = item.id }
+                                else if hoveredBoardID == item.id { hoveredBoardID = nil }
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 6)
+            }
+            .frame(maxHeight: 250)
+
+            Divider()
+                .padding(.horizontal, 8)
+
+            // 5. Bottom Quick Actions
+            HStack {
+                Button {
+                    onNewBoard()
+                } label: {
+                    Label("New Board", systemImage: "plus.circle")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.primary.opacity(0.85))
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+
+                Button {
+                    onReturnToGallery()
+                } label: {
+                    Text("View All (\(boardManager.boards.count))")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.accentColor)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+        .frame(width: 300)
+    }
+
+    @ViewBuilder
+    private func boardMiniThumbnail(for item: BoardItem) -> some View {
+        if let thumbURL = item.thumbnailURL, let img = NSImage(contentsOf: thumbURL) {
+            Image(nsImage: img)
+                .resizable()
+                .scaledToFill()
+        } else {
+            ZStack {
+                Color(NSColor.controlBackgroundColor)
+                Image(systemName: "pencil.and.outline")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary.opacity(0.7))
+            }
+        }
+    }
+
+    private func formatDate(_ date: Date) -> String {
+        let cal = Calendar.current
+        if cal.isDateInToday(date) {
+            let df = DateFormatter()
+            df.timeStyle = .short
+            return "Today, " + df.string(from: date)
+        } else if cal.isDateInYesterday(date) {
+            return "Yesterday"
+        } else {
+            let df = DateFormatter()
+            df.dateStyle = .short
+            return df.string(from: date)
+        }
+    }
+}
+
+// MARK: - 1. Top-Left: Freeform Navigation Pill (< Boards, Title, Board Switcher Menu)
 public struct FreeformWhiteboardTitleView: View {
     @ObservedObject public var state: FreeformWhiteboardState
     public weak var delegate: FreeformWhiteboardActionDelegate?
 
     @State private var isEditingTitle: Bool = false
     @State private var tempTitle: String = ""
+    @State private var backButtonAnchor: NSView?
 
     public init(state: FreeformWhiteboardState, delegate: FreeformWhiteboardActionDelegate?) {
         self.state = state
@@ -91,21 +357,53 @@ public struct FreeformWhiteboardTitleView: View {
     }
 
     public var body: some View {
-        HStack(spacing: 6) {
-            // Open Board Folder button
-            Button {
-                delegate?.freeformDidRequestOpenBoard()
-            } label: {
-                Image(systemName: "folder")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.primary.opacity(0.8))
-                    .frame(width: 24, height: 24)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Open Whiteboard File... (⌘O)")
+        HStack(spacing: 3) {
+            // Freeform Back Button: < Boards ▾
+            HStack(spacing: 0) {
+                // Clicking chevron returns directly to Gallery
+                Button {
+                    WhiteboardPopoverPresenter.shared.close()
+                    delegate?.freeformDidRequestReturnToGallery()
+                } label: {
+                    Image(systemName: "chevron.backward")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.accentColor)
+                        .padding(.leading, 6)
+                        .padding(.trailing, 2)
+                        .frame(height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Back to Boards Gallery (Auto-saves)")
 
-            // Document Title & Actions Dropdown
+                // Clicking "Boards ▾" opens the boards list popover via WhiteboardPopoverPresenter
+                Button {
+                    toggleBoardsPopover()
+                } label: {
+                    HStack(spacing: 3) {
+                        Text("Boards")
+                            .font(.system(size: 12, weight: .semibold))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(.accentColor.opacity(0.8))
+                    }
+                    .foregroundColor(.accentColor)
+                    .padding(.trailing, 6)
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Show list of boards")
+            }
+            .background(PopoverAnchorView { backButtonAnchor = $0 })
+
+            // Capsule Divider
+            RoundedRectangle(cornerRadius: 0.5)
+                .fill(Color.primary.opacity(0.18))
+                .frame(width: 1, height: 14)
+                .padding(.horizontal, 2)
+
+            // Document Title & Quick Actions Menu
             Menu {
                 Button {
                     tempTitle = state.documentTitle
@@ -113,8 +411,6 @@ public struct FreeformWhiteboardTitleView: View {
                 } label: {
                     Label("Rename Board...", systemImage: "pencil")
                 }
-
-                Divider()
 
                 Button {
                     delegate?.freeformDidRequestNewBoard()
@@ -125,7 +421,7 @@ public struct FreeformWhiteboardTitleView: View {
                 Button {
                     delegate?.freeformDidRequestOpenBoard()
                 } label: {
-                    Label("Open Board...", systemImage: "folder")
+                    Label("Open Board File...", systemImage: "folder")
                 }
 
                 Button {
@@ -135,17 +431,18 @@ public struct FreeformWhiteboardTitleView: View {
                 }
 
                 Button {
-                    delegate?.freeformDidRequestSaveBoardAs()
+                    delegate?.freeformDidRequestExportPDF()
                 } label: {
-                    Label("Save Board As...", systemImage: "square.and.arrow.down.fill")
+                    Label("Export to PDF...", systemImage: "arrow.down.doc")
                 }
 
                 Divider()
 
                 Button {
-                    delegate?.freeformDidRequestExportPDF()
+                    WhiteboardPopoverPresenter.shared.close()
+                    delegate?.freeformDidRequestReturnToGallery()
                 } label: {
-                    Label("Export to PDF...", systemImage: "arrow.down.doc")
+                    Label("All Boards Gallery", systemImage: "square.grid.2x2")
                 }
             } label: {
                 HStack(spacing: 4) {
@@ -161,8 +458,9 @@ public struct FreeformWhiteboardTitleView: View {
                 .contentShape(Rectangle())
             }
             .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
             .fixedSize()
-            .help("Board Actions")
+            .help("Board Actions (Rename, Export, New)")
             .popover(isPresented: $isEditingTitle, arrowEdge: .bottom) {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Rename Whiteboard")
@@ -186,16 +484,10 @@ public struct FreeformWhiteboardTitleView: View {
                 }
                 .padding(14)
             }
-
-            if state.savedFeedback {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundColor(.green)
-                    .transition(.opacity.combined(with: .scale))
-            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
+        .frame(height: 28)
         .background(.ultraThinMaterial)
         .clipShape(Capsule())
         .overlay(
@@ -210,6 +502,31 @@ public struct FreeformWhiteboardTitleView: View {
                 )
         )
         .shadow(color: Color.black.opacity(0.08), radius: 8, x: 0, y: 2)
+    }
+
+    private func toggleBoardsPopover() {
+        if WhiteboardPopoverPresenter.shared.isShowing {
+            WhiteboardPopoverPresenter.shared.close()
+        } else if let anchor = backButtonAnchor {
+            WhiteboardPopoverPresenter.shared.show(from: anchor, preferredEdge: .maxY) {
+                BoardsListPopoverView(
+                    boardManager: BoardManager.shared,
+                    currentBoardTitle: state.documentTitle,
+                    onSelectBoard: { id in
+                        WhiteboardPopoverPresenter.shared.close()
+                        delegate?.freeformDidRequestSwitchBoard(id: id)
+                    },
+                    onReturnToGallery: {
+                        WhiteboardPopoverPresenter.shared.close()
+                        delegate?.freeformDidRequestReturnToGallery()
+                    },
+                    onNewBoard: {
+                        WhiteboardPopoverPresenter.shared.close()
+                        delegate?.freeformDidRequestNewBoard()
+                    }
+                )
+            }
+        }
     }
 
     private func commitRename() {

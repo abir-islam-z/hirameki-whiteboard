@@ -9,6 +9,7 @@ public struct WhiteboardDocument: Identifiable, Codable {
     public var createdAt: Date
     public var modifiedAt: Date
     public var fileURL: URL?
+    public var isFavorite: Bool
 
     public init(
         id: UUID = UUID(),
@@ -17,7 +18,8 @@ public struct WhiteboardDocument: Identifiable, Codable {
         activePageIndex: Int = 0,
         createdAt: Date = Date(),
         modifiedAt: Date = Date(),
-        fileURL: URL? = nil
+        fileURL: URL? = nil,
+        isFavorite: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -26,6 +28,35 @@ public struct WhiteboardDocument: Identifiable, Codable {
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt
         self.fileURL = fileURL
+        self.isFavorite = isFavorite
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, pages, activePageIndex, createdAt, modifiedAt, fileURL, isFavorite
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        pages = try container.decode([WhiteboardPage].self, forKey: .pages)
+        activePageIndex = try container.decode(Int.self, forKey: .activePageIndex)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        modifiedAt = try container.decode(Date.self, forKey: .modifiedAt)
+        fileURL = try container.decodeIfPresent(URL.self, forKey: .fileURL)
+        isFavorite = try container.decodeIfPresent(Bool.self, forKey: .isFavorite) ?? false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(pages, forKey: .pages)
+        try container.encode(activePageIndex, forKey: .activePageIndex)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(modifiedAt, forKey: .modifiedAt)
+        try container.encodeIfPresent(fileURL, forKey: .fileURL)
+        try container.encode(isFavorite, forKey: .isFavorite)
     }
 
     public static let fileExtension = "hiramekiboard"

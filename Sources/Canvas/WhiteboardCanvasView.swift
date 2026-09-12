@@ -13,6 +13,13 @@ public protocol WhiteboardCanvasDelegate: AnyObject {
     func canvasDidRequestOpen()
     func canvasDidRequestExportPDF()
     func canvasDidRequestNewBoard()
+    func canvasDidRequestReturnToGallery()
+    func canvasDidRequestSwitchBoard(id: UUID)
+}
+
+public extension WhiteboardCanvasDelegate {
+    func canvasDidRequestReturnToGallery() {}
+    func canvasDidRequestSwitchBoard(id: UUID) {}
 }
 
 public enum ResizeHandle: String, CaseIterable, Equatable {
@@ -270,8 +277,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
             let size = pHost.fittingSize
             let w = max(260, size.width)
             let h = max(34, size.height)
-            let blWidth = freeformBottomLeftHost?.frame.width ?? 260
-            pHost.frame = NSRect(x: padX + blWidth + 12, y: padY, width: w, height: h)
+            pHost.frame = NSRect(x: bounds.width - padX - w, y: padY, width: w, height: h)
         }
     }
 
@@ -369,6 +375,18 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
         }
 
         updateTransform()
+        needsDisplay = true
+    }
+
+    public func loadDocument(_ doc: WhiteboardDocument) {
+        self.document = doc
+        self.redoStack.removeAll()
+        self.selectedStrokeIndex = nil
+        self.selectedPDFIndex = nil
+        self.selectedImageIndex = nil
+        self.currentStroke = nil
+        self.freeformState.documentTitle = doc.title
+        loadCurrentPage()
         needsDisplay = true
     }
 
@@ -2096,5 +2114,13 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
 
     public func freeformDidZoomToFit() {
         zoomToFit()
+    }
+
+    public func freeformDidRequestReturnToGallery() {
+        canvasDelegate?.canvasDidRequestReturnToGallery()
+    }
+
+    public func freeformDidRequestSwitchBoard(id: UUID) {
+        canvasDelegate?.canvasDidRequestSwitchBoard(id: id)
     }
 }
