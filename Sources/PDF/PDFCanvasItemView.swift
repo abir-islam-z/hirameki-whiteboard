@@ -133,8 +133,18 @@ public final class PDFCanvasItemView: NSView {
         delegate?.pdfItemDidRequestDelete(embeddedPDF)
     }
 
-    // Drag capsule to move PDF on infinite canvas
+    // Drag capsule to move PDF on infinite canvas.
+    // We must not intercept clicks that land on interactive controls (buttons),
+    // otherwise their target-action never fires.
     public override func mouseDown(with event: NSEvent) {
+        let localPt = convert(event.locationInWindow, from: nil)
+        let interactiveViews: [NSView] = [prevPageButton, nextPageButton, deleteButton]
+        let hitControl = interactiveViews.contains { btn in btn.frame.contains(localPt) }
+        if hitControl {
+            // Let AppKit route normally so the button target-action fires
+            super.mouseDown(with: event)
+            return
+        }
         isDragging = true
         dragStartMouse = event.locationInWindow
         dragStartOrigin = embeddedPDF.origin

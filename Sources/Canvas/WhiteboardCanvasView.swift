@@ -7,6 +7,7 @@ public protocol WhiteboardCanvasDelegate: AnyObject {
     func canvasDidUpdateDocument(_ doc: WhiteboardDocument)
     func canvasDidRequestNewPage()
     func canvasDidRequestInsertPDF()
+    func canvasDidRequestInsertImage()
     func canvasDidRequestSave()
     func canvasDidRequestSaveAs()
     func canvasDidRequestOpen()
@@ -30,9 +31,10 @@ private enum TransformMode: Equatable {
     case moving
     case resizing(handle: ResizeHandle, anchor: CGPoint, initialBounds: CGRect)
     case movingPDF(initialOrigin: CGPoint)
+    case movingImage(initialOrigin: CGPoint)
 }
 
-public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFieldDelegate, FreeformWhiteboardActionDelegate {
+public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCanvasItemDelegate, NSTextFieldDelegate, FreeformWhiteboardActionDelegate {
     public var document: WhiteboardDocument
     public weak var canvasDelegate: WhiteboardCanvasDelegate?
 
@@ -101,6 +103,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     private var redoStack: [Stroke] = []
     public var selectedStrokeIndex: Int?
     public var selectedPDFIndex: Int?
+    public var selectedImageIndex: Int?
 
     // Interactive Transformation
     private var transformMode: TransformMode = .none
@@ -119,8 +122,9 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     private var laserStrokes: [(stroke: Stroke, fadeStartTime: TimeInterval)] = []
     private var laserDisplayTimer: Timer?
 
-    // Child PDF item views
+    // Child PDF & Image item views
     private var pdfItemViews: [UUID: PDFCanvasItemView] = [:]
+    private var imageItemViews: [UUID: ImageCanvasItemView] = [:]
 
     // Text Editing
     private var activeTextField: NSTextField?
@@ -129,6 +133,8 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     // Floating UI Hosting Views
     private var freeformBottomLeftHost: NSHostingView<FreeformWhiteboardBottomLeftBar>?
     private var pageBarHost: NSHostingView<PageNavigationBar>?
+    // Observable proxy: updated after every page switch so SwiftUI re-renders the nav bar
+    private let documentProxy = DocumentProxy()
 
     public init(frame: NSRect, document: WhiteboardDocument = WhiteboardDocument()) {
         self.document = document
@@ -170,14 +176,10 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         self.freeformBottomLeftHost = blHost
 
         // 2. Multi-Page Navigation Bar
+        // Use documentProxy (ObservableObject) so page switches trigger SwiftUI re-renders.
+        documentProxy.document = document
         let pageView = PageNavigationBar(
-            document: Binding(
-                get: { [weak self] in self?.document ?? WhiteboardDocument() },
-                set: { [weak self] newDoc in
-                    self?.document = newDoc
-                    self?.canvasDelegate?.canvasDidUpdateDocument(newDoc)
-                }
-            ),
+            proxy: documentProxy,
             onSelectPage: { [weak self] idx in self?.switchToPage(at: idx) },
             onAddPage: { [weak self] in self?.addNewPage() },
             onDuplicatePage: { [weak self] idx in self?.duplicatePage(at: idx) },
@@ -237,6 +239,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         saveCurrentPageState()
         document.activePageIndex = max(0, min(index, document.pages.count - 1))
         loadCurrentPage()
+        documentProxy.document = document   // sync → triggers SwiftUI re-render of nav bar
         canvasDelegate?.canvasDidUpdateDocument(document)
     }
 
@@ -259,11 +262,13 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         clearSelection()
         document.deletePage(at: index)
         loadCurrentPage()
+        documentProxy.document = document   // sync → triggers SwiftUI re-render of nav bar
         canvasDelegate?.canvasDidUpdateDocument(document)
     }
 
     public func renamePage(at index: Int, to newName: String) {
         document.renamePage(at: index, to: newName)
+        documentProxy.document = document   // sync → triggers SwiftUI re-render of nav bar
         canvasDelegate?.canvasDidUpdateDocument(document)
         needsDisplay = true
     }
@@ -281,6 +286,11 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         }
         pdfItemViews.removeAll()
 
+        for (_, view) in imageItemViews {
+            view.removeFromSuperview()
+        }
+        imageItemViews.removeAll()
+
         let page = document.activePage
         self.panOffset = page.panOffset
         self.zoomScale = page.zoomScale == 0 ? 1.0 : page.zoomScale
@@ -288,9 +298,15 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         self.freeformState.pattern = page.pattern
         self.redoStack.removeAll()
         self.selectedStrokeIndex = nil
+        self.selectedPDFIndex = nil
+        self.selectedImageIndex = nil
 
         for pdf in page.embeddedPDFs {
             addPDFItemView(pdf)
+        }
+
+        for img in page.embeddedImages {
+            addImageItemView(img)
         }
 
         updateTransform()
@@ -309,6 +325,18 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         layoutPDFItem(itemView)
     }
 
+    private func addImageItemView(_ image: EmbeddedImage) {
+        let itemView = ImageCanvasItemView(embeddedImage: image)
+        itemView.delegate = self
+        imageItemViews[image.id] = itemView
+        if let bl = freeformBottomLeftHost {
+            addSubview(itemView, positioned: .below, relativeTo: bl)
+        } else {
+            addSubview(itemView)
+        }
+        layoutImageItem(itemView)
+    }
+
     private func layoutPDFItem(_ view: PDFCanvasItemView) {
         let p = view.embeddedPDF.origin
         let screenX = (p.x * zoomScale) + panOffset.x
@@ -322,9 +350,25 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         view.frame = NSRect(x: pillX, y: pillY, width: pillW, height: pillH)
     }
 
+    private func layoutImageItem(_ view: ImageCanvasItemView) {
+        let p = view.embeddedImage.origin
+        let screenX = (p.x * zoomScale) + panOffset.x
+        let screenY = (p.y * zoomScale) + panOffset.y
+        let screenW = view.embeddedImage.width * zoomScale
+        let screenH = view.embeddedImage.height * zoomScale
+        let pillW: CGFloat = 220
+        let pillH: CGFloat = 32
+        let pillX = screenX + (screenW - pillW) / 2.0
+        let pillY = screenY + screenH + 8
+        view.frame = NSRect(x: pillX, y: pillY, width: pillW, height: pillH)
+    }
+
     private func updateTransform() {
         for (_, view) in pdfItemViews {
             layoutPDFItem(view)
+        }
+        for (_, view) in imageItemViews {
+            layoutImageItem(view)
         }
     }
 
@@ -352,6 +396,33 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     }
 
     public func pdfItemCurrentZoomScale() -> CGFloat {
+        return zoomScale
+    }
+
+    // MARK: - ImageCanvasItemDelegate
+    public func imageItemDidUpdateFrame(_ item: EmbeddedImage) {
+        if let idx = document.activePage.embeddedImages.firstIndex(where: { $0.id == item.id }) {
+            document.activePage.embeddedImages[idx] = item
+            canvasDelegate?.canvasDidUpdateDocument(document)
+            updateTransform()
+            needsDisplay = true
+        }
+    }
+
+    public func imageItemDidRequestDelete(_ item: EmbeddedImage) {
+        if let idx = document.activePage.embeddedImages.firstIndex(where: { $0.id == item.id }) {
+            document.activePage.embeddedImages.remove(at: idx)
+            imageItemViews[item.id]?.removeFromSuperview()
+            imageItemViews.removeValue(forKey: item.id)
+            if selectedImageIndex == idx {
+                selectedImageIndex = nil
+            }
+            canvasDelegate?.canvasDidUpdateDocument(document)
+            needsDisplay = true
+        }
+    }
+
+    public func imageItemCurrentZoomScale() -> CGFloat {
         return zoomScale
     }
 
@@ -384,6 +455,41 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         addPDFItemView(emb)
         canvasDelegate?.canvasDidUpdateDocument(document)
         needsDisplay = true
+    }
+
+    // MARK: - Insert Image Attachment
+    public func insertImage(data: Data, title: String = "Image", at canvasPoint: CGPoint? = nil) {
+        guard let img = NSImage(data: data) else { return }
+
+        let rep = img.representations.first
+        let pixelW = CGFloat(rep?.pixelsWide ?? Int(img.size.width))
+        let pixelH = CGFloat(rep?.pixelsHigh ?? Int(img.size.height))
+        let aspect = max(1.0, pixelH) / max(1.0, pixelW)
+
+        let maxW = min(600.0, max(300.0, bounds.width * 0.50))
+        let maxH = min(max(250.0, bounds.height - 180.0), maxW * aspect)
+        let finalW = maxH / aspect
+        let finalH = maxH
+
+        let targetPoint = canvasPoint ?? canvasPointFromScreen(CGPoint(x: bounds.midX, y: (bounds.height - 40.0) / 2.0))
+
+        let emb = EmbeddedImage(
+            title: title,
+            imageData: data,
+            origin: CGPoint(x: targetPoint.x - finalW / 2.0, y: targetPoint.y - finalH / 2.0),
+            width: finalW,
+            height: finalH
+        )
+
+        document.activePage.embeddedImages.append(emb)
+        addImageItemView(emb)
+        canvasDelegate?.canvasDidUpdateDocument(document)
+        needsDisplay = true
+    }
+
+    public func insertImage(url: URL, at canvasPoint: CGPoint? = nil) {
+        guard let data = try? Data(contentsOf: url) else { return }
+        insertImage(data: data, title: url.lastPathComponent, at: canvasPoint)
     }
 
     // MARK: - Coordinate Mapping
@@ -421,7 +527,8 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         ctx.translateBy(x: panOffset.x, y: panOffset.y)
         ctx.scaleBy(x: zoomScale, y: zoomScale)
 
-        // Draw Embedded PDFs directly on canvas (crisp vector pages, zero scrollbars)
+        // Draw Embedded Images & PDFs directly on canvas (rasterized attachments, zero scrollbars)
+        drawEmbeddedImages(in: ctx)
         drawEmbeddedPDFs(in: ctx)
 
         // Draw Completed Page Strokes (annotations, highlighters, shapes, notes)
@@ -495,6 +602,62 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         while y < bounds.height {
             ctx.strokeLineSegments(between: [CGPoint(x: 0, y: y), CGPoint(x: bounds.width, y: y)])
             y += gridSpacing
+        }
+    }
+
+    private func drawEmbeddedImages(in ctx: CGContext) {
+        for (iIdx, emb) in document.activePage.embeddedImages.enumerated() {
+            let imgRect = CGRect(x: emb.originX, y: emb.originY, width: emb.width, height: emb.height)
+            let cornerRadius: CGFloat = 6.0
+
+            // 1. Soft realistic drop shadow under image
+            ctx.saveGState()
+            ctx.setShadow(
+                offset: CGSize(width: 0, height: -3.5 / zoomScale),
+                blur: 12.0 / zoomScale,
+                color: NSColor.black.withAlphaComponent(0.18).cgColor
+            )
+            ctx.setFillColor(NSColor.white.cgColor)
+            let shadowPath = CGPath(roundedRect: imgRect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+            ctx.addPath(shadowPath)
+            ctx.fillPath()
+            ctx.restoreGState()
+
+            // 2. Render rasterized image directly into graphics context
+            ctx.saveGState()
+            let clipPath = CGPath(roundedRect: imgRect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+            ctx.addPath(clipPath)
+            ctx.clip()
+
+            if let img = emb.makeImage() {
+                var proposedRect = CGRect(origin: .zero, size: img.size)
+                if let cgImg = img.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) {
+                    ctx.draw(cgImg, in: imgRect)
+                } else {
+                    img.draw(in: imgRect)
+                }
+            }
+            ctx.restoreGState()
+
+            // 3. Crisp subtle photo border
+            ctx.saveGState()
+            ctx.setStrokeColor(NSColor(white: 0.85, alpha: 0.85).cgColor)
+            ctx.setLineWidth(1.0 / zoomScale)
+            let borderPath = CGPath(roundedRect: imgRect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+            ctx.addPath(borderPath)
+            ctx.strokePath()
+            ctx.restoreGState()
+
+            // 4. Selection Highlight if selected with .select tool
+            if activeTool == .select && selectedImageIndex == iIdx {
+                ctx.saveGState()
+                ctx.setStrokeColor(NSColor.systemBlue.cgColor)
+                ctx.setLineWidth(2.5 / zoomScale)
+                let selPath = CGPath(roundedRect: imgRect.insetBy(dx: -2 / zoomScale, dy: -2 / zoomScale), cornerWidth: cornerRadius + 2, cornerHeight: cornerRadius + 2, transform: nil)
+                ctx.addPath(selPath)
+                ctx.strokePath()
+                ctx.restoreGState()
+            }
         }
     }
 
@@ -805,6 +968,16 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
                 return
             }
 
+            if case .movingImage(let initOrigin) = transformMode, let iIdx = selectedImageIndex, iIdx < document.activePage.embeddedImages.count {
+                let deltaX = canvasPt.x - dragStartPos.x
+                let deltaY = canvasPt.y - dragStartPos.y
+                document.activePage.embeddedImages[iIdx].origin = CGPoint(x: initOrigin.x + deltaX, y: initOrigin.y + deltaY)
+                updateTransform()
+                hasMovedSignificantly = true
+                needsDisplay = true
+                return
+            }
+
             if let selIdx = selectedStrokeIndex, selIdx < document.activePage.strokes.count {
                 switch transformMode {
             case .moving:
@@ -859,7 +1032,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
                 needsDisplay = true
                 return
 
-            case .none, .movingPDF:
+            case .none, .movingPDF, .movingImage:
                 break
             }
         }
@@ -988,11 +1161,27 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             }
         }
 
-        // 3. Click on any PDF to select or drag it
+        // 3. Click on any Image to select or drag it
+        for (iIdx, emb) in document.activePage.embeddedImages.enumerated().reversed() {
+            let imgRect = CGRect(x: emb.originX, y: emb.originY, width: emb.width, height: emb.height)
+            if imgRect.contains(canvasPt) {
+                selectedImageIndex = iIdx
+                selectedPDFIndex = nil
+                selectedStrokeIndex = nil
+                transformMode = .movingImage(initialOrigin: emb.origin)
+                dragStartPos = canvasPt
+                hasMovedSignificantly = false
+                needsDisplay = true
+                return
+            }
+        }
+
+        // 4. Click on any PDF to select or drag it
         for (pIdx, emb) in document.activePage.embeddedPDFs.enumerated().reversed() {
             let pdfRect = CGRect(x: emb.originX, y: emb.originY, width: emb.width, height: emb.height)
             if pdfRect.contains(canvasPt) {
                 selectedPDFIndex = pIdx
+                selectedImageIndex = nil
                 selectedStrokeIndex = nil
                 transformMode = .movingPDF(initialOrigin: emb.origin)
                 dragStartPos = canvasPt
@@ -1002,13 +1191,14 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             }
         }
 
-        // 4. Clicked empty space
+        // 5. Clicked empty space
         clearSelection()
     }
 
     public func clearSelection() {
         selectedStrokeIndex = nil
         selectedPDFIndex = nil
+        selectedImageIndex = nil
         transformMode = .none
         needsDisplay = true
     }
@@ -1292,25 +1482,75 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         needsDisplay = true
     }
 
-    // Drag and Drop PDF support
+    // Drag and Drop PDF & Image support
     public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         if let pasteboard = sender.draggingPasteboard.propertyList(forType: .fileURL) as? String,
-           let url = URL(string: pasteboard),
-           url.pathExtension.lowercased() == "pdf" {
+           let url = URL(string: pasteboard) {
+            let ext = url.pathExtension.lowercased()
+            if ext == "pdf" || ["png", "jpg", "jpeg", "gif", "tiff", "tif", "webp", "heic", "bmp"].contains(ext) {
+                return .copy
+            }
+        }
+        if sender.draggingPasteboard.canReadObject(forClasses: [NSImage.self], options: nil) {
             return .copy
         }
         return []
     }
 
     public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let loc = convert(sender.draggingLocation, from: nil)
+        let canvasPt = canvasPointFromScreen(loc)
+
         if let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
-            for url in urls where url.pathExtension.lowercased() == "pdf" {
-                let loc = convert(sender.draggingLocation, from: nil)
-                insertPDF(url: url, at: canvasPointFromScreen(loc))
-                return true
+            for url in urls {
+                let ext = url.pathExtension.lowercased()
+                if ext == "pdf" {
+                    insertPDF(url: url, at: canvasPt)
+                    return true
+                } else if ["png", "jpg", "jpeg", "gif", "tiff", "tif", "webp", "heic", "bmp"].contains(ext) {
+                    insertImage(url: url, at: canvasPt)
+                    return true
+                }
             }
         }
+
+        if let images = sender.draggingPasteboard.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage],
+           let img = images.first,
+           let tiffData = img.tiffRepresentation {
+            insertImage(data: tiffData, title: "Dropped Image", at: canvasPt)
+            return true
+        }
+
         return false
+    }
+
+    // MARK: - Clipboard Paste
+    @discardableResult
+    public func pasteImageFromClipboard() -> Bool {
+        let pb = NSPasteboard.general
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
+            for url in urls {
+                let ext = url.pathExtension.lowercased()
+                if ext == "pdf" {
+                    insertPDF(url: url)
+                    return true
+                } else if ["png", "jpg", "jpeg", "gif", "tiff", "tif", "webp", "heic", "bmp"].contains(ext) {
+                    insertImage(url: url)
+                    return true
+                }
+            }
+        }
+        if let images = pb.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage],
+           let img = images.first,
+           let tiffData = img.tiffRepresentation {
+            insertImage(data: tiffData, title: "Pasted Image")
+            return true
+        }
+        return false
+    }
+
+    @objc public func paste(_ sender: Any?) {
+        pasteImageFromClipboard()
     }
 
     // MARK: - Keyboard Handling
@@ -1331,6 +1571,13 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             return
         }
 
+        // Command+V Paste
+        if event.modifierFlags.contains(.command) && (event.charactersIgnoringModifiers == "v" || event.characters == "v") {
+            if pasteImageFromClipboard() {
+                return
+            }
+        }
+
         // Delete / Backspace key
         if event.keyCode == 51 || event.keyCode == 117 {
             if let idx = selectedStrokeIndex, idx < document.activePage.strokes.count {
@@ -1338,6 +1585,12 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
                 selectedStrokeIndex = nil
                 canvasDelegate?.canvasDidUpdateDocument(document)
                 needsDisplay = true
+                return
+            }
+            if let iIdx = selectedImageIndex, iIdx < document.activePage.embeddedImages.count {
+                let emb = document.activePage.embeddedImages[iIdx]
+                imageItemDidRequestDelete(emb)
+                selectedImageIndex = nil
                 return
             }
             if let pIdx = selectedPDFIndex, pIdx < document.activePage.embeddedPDFs.count {
@@ -1459,6 +1712,10 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
 
     public func freeformDidRequestInsertPDF() {
         canvasDelegate?.canvasDidRequestInsertPDF()
+    }
+
+    public func freeformDidRequestInsertImage() {
+        canvasDelegate?.canvasDidRequestInsertImage()
     }
 
     public func freeformDidRequestRename(to newTitle: String) {

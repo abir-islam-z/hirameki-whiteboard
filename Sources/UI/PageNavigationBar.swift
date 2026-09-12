@@ -1,8 +1,18 @@
 import SwiftUI
 import AppKit
 
+// Observable proxy so WhiteboardCanvasView can push document updates
+// into the SwiftUI PageNavigationBar and trigger automatic re-renders.
+public final class DocumentProxy: ObservableObject {
+    @Published public var document: WhiteboardDocument
+
+    public init(document: WhiteboardDocument = WhiteboardDocument()) {
+        self.document = document
+    }
+}
+
 public struct PageNavigationBar: View {
-    @Binding var document: WhiteboardDocument
+    @ObservedObject var proxy: DocumentProxy
     var onSelectPage: (Int) -> Void
     var onAddPage: () -> Void
     var onDuplicatePage: (Int) -> Void
@@ -12,6 +22,9 @@ public struct PageNavigationBar: View {
     var onZoomOut: () -> Void
     var onResetZoom: () -> Void
     var currentZoom: CGFloat
+
+    // Convenience accessor
+    private var document: WhiteboardDocument { proxy.document }
 
     @State private var showPagesPopover: Bool = false
     @State private var editingPageIndex: Int?
