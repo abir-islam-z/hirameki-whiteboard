@@ -45,6 +45,19 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             if activeTool != .select {
                 clearSelection()
             }
+            switch activeTool {
+            case .pen:
+                self.activeWidth = self.penWidth
+            case .highlighter:
+                self.activeWidth = self.markerWidth
+            case .laser:
+                self.activeWidth = self.laserWidth
+            case .rect, .circle, .arrow, .line:
+                self.activeWidth = self.shapeWidth
+            default:
+                break
+            }
+            freeformState.activeWidth = self.activeWidth
         }
     }
     public var activeColor: NSColor = .black {
@@ -57,6 +70,10 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             freeformState.activeWidth = activeWidth
         }
     }
+    public var penWidth: CGFloat = 4.0
+    public var markerWidth: CGFloat = 18.0
+    public var shapeWidth: CGFloat = 3.0
+    public var laserWidth: CGFloat = 6.0
     public var eraserType: EraserType = .object {
         didSet {
             freeformState.eraserType = eraserType
@@ -134,6 +151,10 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         freeformState.activeTool = activeTool
         freeformState.activeColor = Color(activeColor)
         freeformState.activeWidth = activeWidth
+        freeformState.penWidth = penWidth
+        freeformState.markerWidth = markerWidth
+        freeformState.shapeWidth = shapeWidth
+        freeformState.laserWidth = laserWidth
         freeformState.zoomScale = zoomScale
         freeformState.eraserType = eraserType
         freeformState.pattern = document.activePage.pattern
@@ -751,7 +772,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
 
         // Start drawing stroke or laser
         let pt = StrokePoint(x: canvasPt.x, y: canvasPt.y, pressure: CGFloat(event.pressure))
-        let width = activeWidth / (activeTool == .highlighter ? 1.0 : zoomScale)
+        let width = activeWidth / zoomScale
         currentStroke = Stroke(
             tool: activeTool,
             points: [pt],
@@ -1334,7 +1355,8 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
 
         switch chars {
         case "v": activeTool = .select
-        case "h", "m": activeTool = .hand
+        case "h": activeTool = .hand
+        case "m": activeTool = .highlighter
         case "p": activeTool = .pen
         case "d": activeTool = .laser
         case "e": activeTool = .eraser
@@ -1384,11 +1406,35 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     public func freeformDidChangeColor(_ color: NSColor) {
         self.activeColor = color
         self.freeformState.activeColor = Color(color)
+        if let idx = selectedStrokeIndex, idx < document.activePage.strokes.count {
+            document.activePage.strokes[idx].colorHex = color.hexString
+            needsDisplay = true
+        }
     }
 
     public func freeformDidChangeWidth(_ width: CGFloat) {
         self.activeWidth = width
         self.freeformState.activeWidth = width
+        switch activeTool {
+        case .pen:
+            self.penWidth = width
+            self.freeformState.penWidth = width
+        case .highlighter:
+            self.markerWidth = width
+            self.freeformState.markerWidth = width
+        case .laser:
+            self.laserWidth = width
+            self.freeformState.laserWidth = width
+        case .rect, .circle, .arrow, .line:
+            self.shapeWidth = width
+            self.freeformState.shapeWidth = width
+        default:
+            break
+        }
+        if let idx = selectedStrokeIndex, idx < document.activePage.strokes.count {
+            document.activePage.strokes[idx].width = width
+            needsDisplay = true
+        }
     }
 
     public func freeformDidRequestNewBoard() {

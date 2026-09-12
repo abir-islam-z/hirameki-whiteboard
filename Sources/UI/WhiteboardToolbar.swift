@@ -36,6 +36,10 @@ public final class FreeformWhiteboardState: ObservableObject {
     @Published public var activeTool: Tool
     @Published public var activeColor: Color
     @Published public var activeWidth: CGFloat
+    @Published public var penWidth: CGFloat
+    @Published public var markerWidth: CGFloat
+    @Published public var shapeWidth: CGFloat
+    @Published public var laserWidth: CGFloat
     @Published public var documentTitle: String
     @Published public var zoomScale: CGFloat
     @Published public var eraserType: EraserType
@@ -47,6 +51,10 @@ public final class FreeformWhiteboardState: ObservableObject {
         activeTool: Tool = .select,
         activeColor: Color = .black,
         activeWidth: CGFloat = 4.0,
+        penWidth: CGFloat = 4.0,
+        markerWidth: CGFloat = 18.0,
+        shapeWidth: CGFloat = 3.0,
+        laserWidth: CGFloat = 6.0,
         documentTitle: String = "Untitled Board",
         zoomScale: CGFloat = 1.0,
         eraserType: EraserType = .object,
@@ -56,6 +64,10 @@ public final class FreeformWhiteboardState: ObservableObject {
         self.activeTool = activeTool
         self.activeColor = activeColor
         self.activeWidth = activeWidth
+        self.penWidth = penWidth
+        self.markerWidth = markerWidth
+        self.shapeWidth = shapeWidth
+        self.laserWidth = laserWidth
         self.documentTitle = documentTitle
         self.zoomScale = zoomScale
         self.eraserType = eraserType
@@ -209,19 +221,61 @@ public struct FreeformWhiteboardTitleView: View {
     }
 }
 
+// MARK: - Native Popover Presenter for NSToolbar Views
+public final class WhiteboardPopoverPresenter: NSObject, NSPopoverDelegate {
+    public static let shared = WhiteboardPopoverPresenter()
+    private var currentPopover: NSPopover?
+
+    public func show<Content: View>(
+        from anchor: NSView,
+        preferredEdge: NSRectEdge = .maxY,
+        @ViewBuilder content: () -> Content
+    ) {
+        currentPopover?.close()
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.delegate = self
+        popover.contentViewController = NSHostingController(rootView: content())
+        popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: preferredEdge)
+        self.currentPopover = popover
+    }
+
+    public func close() {
+        currentPopover?.close()
+        currentPopover = nil
+    }
+
+    public func popoverDidClose(_ notification: Notification) {
+        currentPopover = nil
+    }
+}
+
+public struct PopoverAnchorView: NSViewRepresentable {
+    let onView: (NSView) -> Void
+    public init(onView: @escaping (NSView) -> Void) {
+        self.onView = onView
+    }
+    public func makeNSView(context: Context) -> NSView {
+        let v = NSView(frame: .zero)
+        DispatchQueue.main.async { onView(v) }
+        return v
+    }
+    public func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async { onView(nsView) }
+    }
+}
+
 // MARK: - 2. Top-Center: Freeform Tools Capsule (Cursor, Hand, Sticky Note, Shapes, Text, Pen, Marker, Laser, Eraser, Color, Clear)
 public struct FreeformWhiteboardToolsCapsule: View {
     @ObservedObject public var state: FreeformWhiteboardState
     public weak var delegate: FreeformWhiteboardActionDelegate?
 
-    @State private var showColorPopover: Bool = false
-    @State private var showPenPopover: Bool = false
-    @State private var showMarkerPopover: Bool = false
-    @State private var showEraserPopover: Bool = false
-    @State private var showShapesPopover: Bool = false
-
-    @State private var penWidth: CGFloat = 4.0
-    @State private var markerWidth: CGFloat = 18.0
+    @State private var shapesAnchor: NSView?
+    @State private var penAnchor: NSView?
+    @State private var markerAnchor: NSView?
+    @State private var eraserAnchor: NSView?
+    @State private var colorAnchor: NSView?
 
     public init(state: FreeformWhiteboardState, delegate: FreeformWhiteboardActionDelegate?) {
         self.state = state
@@ -236,6 +290,7 @@ public struct FreeformWhiteboardToolsCapsule: View {
                 isSelected: state.activeTool == .select,
                 tooltip: "Selection / Pointer (V)"
             ) {
+                WhiteboardPopoverPresenter.shared.close()
                 state.activeTool = .select
                 delegate?.freeformDidSelectTool(.select)
             }
@@ -246,6 +301,7 @@ public struct FreeformWhiteboardToolsCapsule: View {
                 isSelected: state.activeTool == .hand,
                 tooltip: "Move / Pan Canvas (H) • Hold Spacebar"
             ) {
+                WhiteboardPopoverPresenter.shared.close()
                 state.activeTool = .hand
                 delegate?.freeformDidSelectTool(.hand)
             }
@@ -256,13 +312,27 @@ public struct FreeformWhiteboardToolsCapsule: View {
                 isSelected: state.activeTool == .note,
                 tooltip: "Sticky Note (N) — Click to place"
             ) {
+                WhiteboardPopoverPresenter.shared.close()
                 state.activeTool = .note
                 delegate?.freeformDidSelectTool(.note)
             }
 
             // 4. Vector Shapes Dropdown Menu
             Button {
-                showShapesPopover.toggle()
+                if let anchor = shapesAnchor {
+                    WhiteboardPopoverPresenter.shared.show(from: anchor) {
+                        FreeformShapesGridPopover(
+                            activeTool: $state.activeTool,
+                            onSelectShape: { shapeTool in
+                                state.activeTool = shapeTool
+                                state.activeWidth = state.shapeWidth
+                                delegate?.freeformDidSelectTool(shapeTool)
+                                delegate?.freeformDidChangeWidth(state.shapeWidth)
+                                WhiteboardPopoverPresenter.shared.close()
+                            }
+                        )
+                    }
+                }
             } label: {
                 HStack(spacing: 2) {
                     Image(systemName: state.activeTool.isShape ? shapeIcon(for: state.activeTool) : "square.on.circle")
@@ -280,17 +350,8 @@ public struct FreeformWhiteboardToolsCapsule: View {
                 )
             }
             .buttonStyle(.plain)
+            .background(PopoverAnchorView { shapesAnchor = $0 })
             .help("Shapes (R, C, A, L)")
-            .popover(isPresented: $showShapesPopover, arrowEdge: .bottom) {
-                FreeformShapesGridPopover(
-                    activeTool: $state.activeTool,
-                    onSelectShape: { shapeTool in
-                        state.activeTool = shapeTool
-                        delegate?.freeformDidSelectTool(shapeTool)
-                        showShapesPopover = false
-                    }
-                )
-            }
 
             // 5. Text Tool (T)
             capsuleToolButton(
@@ -298,17 +359,38 @@ public struct FreeformWhiteboardToolsCapsule: View {
                 isSelected: state.activeTool == .text,
                 tooltip: "Text Box (T) — Click to write"
             ) {
+                WhiteboardPopoverPresenter.shared.close()
                 state.activeTool = .text
                 delegate?.freeformDidSelectTool(.text)
             }
 
             // 6. Pen Tool (P)
             Button {
-                if state.activeTool == .pen {
-                    showPenPopover.toggle()
-                } else {
+                if state.activeTool != .pen {
                     state.activeTool = .pen
+                    state.activeWidth = state.penWidth
                     delegate?.freeformDidSelectTool(.pen)
+                    delegate?.freeformDidChangeWidth(state.penWidth)
+                }
+                if let anchor = penAnchor {
+                    WhiteboardPopoverPresenter.shared.show(from: anchor) {
+                        ToolThicknessPopover(
+                            title: "Pen Thickness",
+                            activeWidth: $state.penWidth,
+                            options: [
+                                (name: "Fine", value: 2.0),
+                                (name: "Regular", value: 4.0),
+                                (name: "Medium", value: 7.0),
+                                (name: "Bold", value: 12.0)
+                            ],
+                            onWidthPicked: { w in
+                                state.penWidth = w
+                                state.activeWidth = w
+                                delegate?.freeformDidChangeWidth(w)
+                                WhiteboardPopoverPresenter.shared.close()
+                            }
+                        )
+                    }
                 }
             } label: {
                 Image(systemName: "pencil.tip")
@@ -322,33 +404,36 @@ public struct FreeformWhiteboardToolsCapsule: View {
                     )
             }
             .buttonStyle(.plain)
-            .popover(isPresented: $showPenPopover, arrowEdge: .bottom) {
-                ToolThicknessPopover(
-                    title: "Pen Thickness",
-                    activeWidth: $penWidth,
-                    options: [
-                        (name: "Fine", value: 2.0),
-                        (name: "Regular", value: 4.0),
-                        (name: "Medium", value: 7.0),
-                        (name: "Bold", value: 12.0)
-                    ],
-                    onWidthPicked: { w in
-                        penWidth = w
-                        state.activeWidth = w
-                        delegate?.freeformDidChangeWidth(w)
-                        showPenPopover = false
-                    }
-                )
-            }
-            .help("Pen (P) — Click to draw, click again for thickness")
+            .background(PopoverAnchorView { penAnchor = $0 })
+            .help("Pen (P) — Thickness: \(Int(state.penWidth))px • Click to draw or change thickness")
 
             // 7. Marker / Highlighter Tool (M)
             Button {
-                if state.activeTool == .highlighter {
-                    showMarkerPopover.toggle()
-                } else {
+                if state.activeTool != .highlighter {
                     state.activeTool = .highlighter
+                    state.activeWidth = state.markerWidth
                     delegate?.freeformDidSelectTool(.highlighter)
+                    delegate?.freeformDidChangeWidth(state.markerWidth)
+                }
+                if let anchor = markerAnchor {
+                    WhiteboardPopoverPresenter.shared.show(from: anchor) {
+                        ToolThicknessPopover(
+                            title: "Highlighter Width",
+                            activeWidth: $state.markerWidth,
+                            options: [
+                                (name: "Thin", value: 12.0),
+                                (name: "Regular", value: 18.0),
+                                (name: "Broad", value: 28.0),
+                                (name: "Chisel", value: 38.0)
+                            ],
+                            onWidthPicked: { w in
+                                state.markerWidth = w
+                                state.activeWidth = w
+                                delegate?.freeformDidChangeWidth(w)
+                                WhiteboardPopoverPresenter.shared.close()
+                            }
+                        )
+                    }
                 }
             } label: {
                 Image(systemName: "highlighter")
@@ -362,25 +447,8 @@ public struct FreeformWhiteboardToolsCapsule: View {
                     )
             }
             .buttonStyle(.plain)
-            .popover(isPresented: $showMarkerPopover, arrowEdge: .bottom) {
-                ToolThicknessPopover(
-                    title: "Highlighter Width",
-                    activeWidth: $markerWidth,
-                    options: [
-                        (name: "Thin", value: 12.0),
-                        (name: "Regular", value: 18.0),
-                        (name: "Broad", value: 28.0),
-                        (name: "Chisel", value: 38.0)
-                    ],
-                    onWidthPicked: { w in
-                        markerWidth = w
-                        state.activeWidth = w
-                        delegate?.freeformDidChangeWidth(w)
-                        showMarkerPopover = false
-                    }
-                )
-            }
-            .help("Marker / Highlighter (M) — Click again for width")
+            .background(PopoverAnchorView { markerAnchor = $0 })
+            .help("Marker / Highlighter (M) — Width: \(Int(state.markerWidth))px • Click to draw or change width")
 
             // 8. Laser Pointer Tool (D)
             capsuleToolButton(
@@ -388,17 +456,32 @@ public struct FreeformWhiteboardToolsCapsule: View {
                 isSelected: state.activeTool == .laser,
                 tooltip: "Laser Pointer / Vanishing Ink (D)"
             ) {
+                WhiteboardPopoverPresenter.shared.close()
                 state.activeTool = .laser
                 delegate?.freeformDidSelectTool(.laser)
             }
 
             // 9. Eraser Tool with Options Popover (E)
             Button {
-                if state.activeTool == .eraser {
-                    showEraserPopover.toggle()
-                } else {
+                if state.activeTool != .eraser {
                     state.activeTool = .eraser
                     delegate?.freeformDidSelectTool(.eraser)
+                }
+                if let anchor = eraserAnchor {
+                    WhiteboardPopoverPresenter.shared.show(from: anchor) {
+                        EraserOptionsPopover(
+                            eraserType: $state.eraserType,
+                            onTypePicked: { type in
+                                state.eraserType = type
+                                delegate?.freeformDidChangeEraserType(type)
+                                WhiteboardPopoverPresenter.shared.close()
+                            },
+                            onClearBoard: {
+                                WhiteboardPopoverPresenter.shared.close()
+                                delegate?.freeformDidRequestClear()
+                            }
+                        )
+                    }
                 }
             } label: {
                 Image(systemName: state.eraserType == .object ? "eraser.fill" : "circle.dotted")
@@ -412,19 +495,7 @@ public struct FreeformWhiteboardToolsCapsule: View {
                     )
             }
             .buttonStyle(.plain)
-            .popover(isPresented: $showEraserPopover, arrowEdge: .bottom) {
-                EraserOptionsPopover(
-                    eraserType: $state.eraserType,
-                    onTypePicked: { type in
-                        state.eraserType = type
-                        delegate?.freeformDidChangeEraserType(type)
-                    },
-                    onClearBoard: {
-                        showEraserPopover = false
-                        delegate?.freeformDidRequestClear()
-                    }
-                )
-            }
+            .background(PopoverAnchorView { eraserAnchor = $0 })
             .help("Eraser (E) — Click again for Object vs Pixel Eraser")
 
             // Capsule Divider
@@ -432,7 +503,22 @@ public struct FreeformWhiteboardToolsCapsule: View {
 
             // 10. Color Picker with Full Palette Popover
             Button {
-                showColorPopover.toggle()
+                if let anchor = colorAnchor {
+                    WhiteboardPopoverPresenter.shared.show(from: anchor) {
+                        MarkupColorPickerPopover(
+                            selectedColor: $state.activeColor,
+                            onColorPicked: { newColor in
+                                state.activeColor = newColor
+                                delegate?.freeformDidChangeColor(NSColor(newColor))
+                                WhiteboardPopoverPresenter.shared.close()
+                            },
+                            onOpenFullPanel: {
+                                WhiteboardPopoverPresenter.shared.close()
+                                NSColorPanel.shared.orderFront(nil)
+                            }
+                        )
+                    }
+                }
             } label: {
                 Circle()
                     .fill(state.activeColor)
@@ -442,23 +528,11 @@ public struct FreeformWhiteboardToolsCapsule: View {
                             .stroke(Color.primary.opacity(0.25), lineWidth: 1)
                     )
                     .frame(width: 28, height: 28)
-                    .background(showColorPopover ? Color.primary.opacity(0.12) : Color.clear)
+                    .background(Color.clear)
                     .clipShape(Circle())
             }
             .buttonStyle(.plain)
-            .popover(isPresented: $showColorPopover, arrowEdge: .bottom) {
-                MarkupColorPickerPopover(
-                    selectedColor: $state.activeColor,
-                    onColorPicked: { newColor in
-                        state.activeColor = newColor
-                        delegate?.freeformDidChangeColor(NSColor(newColor))
-                        showColorPopover = false
-                    },
-                    onOpenFullPanel: {
-                        showColorPopover = false
-                    }
-                )
-            }
+            .background(PopoverAnchorView { colorAnchor = $0 })
             .help("Color Palette & Eyedropper")
 
             // Capsule Divider
@@ -466,6 +540,7 @@ public struct FreeformWhiteboardToolsCapsule: View {
 
             // 11. All-Clear Circled Cross Button
             Button {
+                WhiteboardPopoverPresenter.shared.close()
                 delegate?.freeformDidRequestClear()
             } label: {
                 CircledCrossIconView(size: 18)
@@ -869,24 +944,30 @@ public struct ToolThicknessPopover: View {
 
             HStack(spacing: 8) {
                 ForEach(options, id: \.value) { opt in
+                    let isSelected = abs(activeWidth - opt.value) < 0.5
                     Button {
                         activeWidth = opt.value
                         onWidthPicked(opt.value)
                     } label: {
                         VStack(spacing: 6) {
                             Circle()
-                                .fill(Color.primary)
+                                .fill(isSelected ? Color.accentColor : Color.primary)
                                 .frame(width: max(4, min(24, opt.value)), height: max(4, min(24, opt.value)))
                                 .frame(width: 28, height: 28)
 
                             Text(opt.name)
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundColor(.primary.opacity(0.85))
+                                .font(.system(size: 10, weight: isSelected ? .bold : .medium))
+                                .foregroundColor(isSelected ? .accentColor : .primary.opacity(0.85))
                         }
                         .padding(.vertical, 6)
-                        .padding(.horizontal, 4)
-                        .background(activeWidth == opt.value ? Color.accentColor.opacity(0.16) : Color.clear)
+                        .padding(.horizontal, 6)
+                        .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
                         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .overlay(
+                            isSelected ?
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .stroke(Color.accentColor.opacity(0.4), lineWidth: 1) : nil
+                        )
                     }
                     .buttonStyle(.plain)
                 }
