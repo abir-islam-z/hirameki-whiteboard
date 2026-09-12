@@ -976,7 +976,12 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
             if case .movingImage(let initOrigin) = transformMode, let iIdx = selectedImageIndex, iIdx < document.activePage.embeddedImages.count {
                 let deltaX = canvasPt.x - dragStartPos.x
                 let deltaY = canvasPt.y - dragStartPos.y
-                document.activePage.embeddedImages[iIdx].origin = CGPoint(x: initOrigin.x + deltaX, y: initOrigin.y + deltaY)
+                let newOrigin = CGPoint(x: initOrigin.x + deltaX, y: initOrigin.y + deltaY)
+                document.activePage.embeddedImages[iIdx].origin = newOrigin
+                // Sync origin into the capsule view's local copy so layoutImageItem
+                // places the toolbar at the live position, not the stale pre-drag one.
+                let imgID = document.activePage.embeddedImages[iIdx].id
+                imageItemViews[imgID]?.embeddedImage.origin = newOrigin
                 updateTransform()
                 hasMovedSignificantly = true
                 needsDisplay = true
