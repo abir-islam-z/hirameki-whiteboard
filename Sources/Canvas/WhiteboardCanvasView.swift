@@ -961,7 +961,12 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
             if case .movingPDF(let initOrigin) = transformMode, let pIdx = selectedPDFIndex, pIdx < document.activePage.embeddedPDFs.count {
                 let deltaX = canvasPt.x - dragStartPos.x
                 let deltaY = canvasPt.y - dragStartPos.y
-                document.activePage.embeddedPDFs[pIdx].origin = CGPoint(x: initOrigin.x + deltaX, y: initOrigin.y + deltaY)
+                let newOrigin = CGPoint(x: initOrigin.x + deltaX, y: initOrigin.y + deltaY)
+                document.activePage.embeddedPDFs[pIdx].origin = newOrigin
+                // Sync origin into the capsule view's local copy so layoutPDFItem
+                // places the toolbar at the live position, not the stale one.
+                let pdfID = document.activePage.embeddedPDFs[pIdx].id
+                pdfItemViews[pdfID]?.embeddedPDF.origin = newOrigin
                 updateTransform()
                 hasMovedSignificantly = true
                 needsDisplay = true
@@ -1599,6 +1604,36 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
                 selectedPDFIndex = nil
                 return
             }
+        }
+
+        // Up/Down arrow keys — navigate PDF pages when a PDF is selected
+        // keyCode 126 = Up arrow, 125 = Down arrow
+        if (event.keyCode == 126 || event.keyCode == 125),
+           let pIdx = selectedPDFIndex,
+           pIdx < document.activePage.embeddedPDFs.count {
+            var pdf = document.activePage.embeddedPDFs[pIdx]
+            if event.keyCode == 126 {
+                // Up arrow → previous page
+                if pdf.currentPage > 0 {
+                    pdf.currentPage -= 1
+                    document.activePage.embeddedPDFs[pIdx] = pdf
+                    pdfItemViews[pdf.id]?.embeddedPDF = pdf
+                    pdfItemViews[pdf.id]?.updatePaginationUI()
+                    canvasDelegate?.canvasDidUpdateDocument(document)
+                    needsDisplay = true
+                }
+            } else {
+                // Down arrow → next page
+                if pdf.currentPage < pdf.pageCount - 1 {
+                    pdf.currentPage += 1
+                    document.activePage.embeddedPDFs[pIdx] = pdf
+                    pdfItemViews[pdf.id]?.embeddedPDF = pdf
+                    pdfItemViews[pdf.id]?.updatePaginationUI()
+                    canvasDelegate?.canvasDidUpdateDocument(document)
+                    needsDisplay = true
+                }
+            }
+            return
         }
 
         guard let chars = event.charactersIgnoringModifiers?.lowercased(), !event.modifierFlags.contains(.command) else {
