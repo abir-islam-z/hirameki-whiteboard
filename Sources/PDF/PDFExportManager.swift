@@ -15,6 +15,9 @@ public final class PDFExportManager {
         for pdf in page.embeddedPDFs {
             allBounds.append(pdf.frame)
         }
+        for img in page.embeddedImages {
+            allBounds.append(img.frame)
+        }
 
         if !allBounds.isEmpty {
             var minX = allBounds[0].minX
@@ -55,7 +58,20 @@ public final class PDFExportManager {
             }
         }
 
-        // 2. Draw Vector Strokes, Shapes, and Text Notes (annotations layer)
+        // 2. Draw Embedded Images
+        for emb in page.embeddedImages {
+            let imgRect = CGRect(x: emb.originX, y: emb.originY, width: emb.width, height: emb.height)
+            if let nsImg = emb.makeImage() {
+                var proposedRect = CGRect(origin: .zero, size: nsImg.size)
+                if let cgImg = nsImg.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) {
+                    ctx.draw(cgImg, in: imgRect)
+                } else {
+                    nsImg.draw(in: imgRect)
+                }
+            }
+        }
+
+        // 3. Draw Vector Strokes, Shapes, and Text Notes (annotations layer)
         let nsCtx = NSGraphicsContext(cgContext: ctx, flipped: false)
         NSGraphicsContext.current = nsCtx
 

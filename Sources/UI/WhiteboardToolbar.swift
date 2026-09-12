@@ -12,6 +12,7 @@ public protocol FreeformWhiteboardActionDelegate: AnyObject {
     func freeformDidRequestSaveBoardAs()
     func freeformDidRequestExportPDF()
     func freeformDidRequestInsertPDF()
+    func freeformDidRequestInsertImage()
     func freeformDidRequestRename(to newTitle: String)
     func freeformDidRequestUndo()
     func freeformDidRequestRedo()
@@ -679,6 +680,29 @@ public struct FreeformWhiteboardPatternView: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
             .help("Board Opacity (Solid vs Frosted)")
+
+            RoundedRectangle(cornerRadius: 0.5)
+                .fill(Color.primary.opacity(0.15))
+                .frame(width: 1, height: 16)
+                .padding(.horizontal, 1)
+
+            // Insert Image Button
+            Button {
+                delegate?.freeformDidRequestInsertImage()
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "photo.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.blue)
+                    Text("Image")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.primary.opacity(0.9))
+                }
+                .padding(.horizontal, 7)
+                .frame(height: 26)
+            }
+            .buttonStyle(.plain)
+            .help("Insert & Annotate Image Attachment (⌘U)")
 
             RoundedRectangle(cornerRadius: 0.5)
                 .fill(Color.primary.opacity(0.15))

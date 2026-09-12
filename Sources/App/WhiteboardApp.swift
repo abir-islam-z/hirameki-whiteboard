@@ -164,6 +164,10 @@ public final class WhiteboardWindow: NSWindow {
                 canvasView.freeformDidRequestInsertPDF()
                 return true
             }
+            if chars == "u" {
+                canvasView.freeformDidRequestInsertImage()
+                return true
+            }
             if chars == "z" {
                 if event.modifierFlags.contains(.shift) {
                     canvasView.redo()
@@ -320,11 +324,26 @@ public final class WhiteboardWindowController: NSWindowController, NSWindowDeleg
         panel.allowedContentTypes = [.pdf]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        panel.canChooseDirectories = false
 
         panel.beginSheetModal(for: win) { [weak self] response in
             if response == .OK, let url = panel.url {
                 self?.canvasView.insertPDF(url: url)
+            }
+        }
+    }
+
+    public func promptInsertImage() {
+        guard let win = whiteboardWindow else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Insert Image Attachment"
+        let types: [UTType] = [.image, .png, .jpeg, .tiff, .gif, .webP, .heic, .bmp]
+        panel.allowedContentTypes = types
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+
+        panel.beginSheetModal(for: win) { [weak self] response in
+            if response == .OK, let url = panel.url {
+                self?.canvasView.insertImage(url: url)
             }
         }
     }
@@ -340,6 +359,10 @@ public final class WhiteboardWindowController: NSWindowController, NSWindowDeleg
 
     public func canvasDidRequestInsertPDF() {
         promptInsertPDF()
+    }
+
+    public func canvasDidRequestInsertImage() {
+        promptInsertImage()
     }
 
     public func canvasDidRequestSave() {
@@ -414,14 +437,27 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
 
     public func application(_ sender: NSApplication, openFile filename: String) -> Bool {
         let url = URL(fileURLWithPath: filename)
-        if url.pathExtension.lowercased() == "pdf" {
+        let ext = url.pathExtension.lowercased()
+        if ext == "pdf" {
             let winCtrl: WhiteboardWindowController
-            if let first = windowControllers.first, first.canvasView.document.activePage.strokes.isEmpty && first.canvasView.document.activePage.embeddedPDFs.isEmpty {
+            if let first = windowControllers.first, first.canvasView.document.activePage.strokes.isEmpty && first.canvasView.document.activePage.embeddedPDFs.isEmpty && first.canvasView.document.activePage.embeddedImages.isEmpty {
                 winCtrl = first
             } else {
                 winCtrl = createBoard()
             }
             winCtrl.canvasView.insertPDF(url: url)
+            winCtrl.whiteboardWindow.makeKeyAndOrderFront(nil)
+            return true
+        }
+
+        if ["png", "jpg", "jpeg", "gif", "tiff", "tif", "webp", "heic", "bmp"].contains(ext) {
+            let winCtrl: WhiteboardWindowController
+            if let first = windowControllers.first, first.canvasView.document.activePage.strokes.isEmpty && first.canvasView.document.activePage.embeddedPDFs.isEmpty && first.canvasView.document.activePage.embeddedImages.isEmpty {
+                winCtrl = first
+            } else {
+                winCtrl = createBoard()
+            }
+            winCtrl.canvasView.insertImage(url: url)
             winCtrl.whiteboardWindow.makeKeyAndOrderFront(nil)
             return true
         }
@@ -486,6 +522,7 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
         saveAs.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(saveAs)
         fileMenu.addItem(NSMenuItem.separator())
+        fileMenu.addItem(withTitle: "Insert Image Attachment...", action: #selector(menuInsertImage), keyEquivalent: "u")
         fileMenu.addItem(withTitle: "Insert PDF Document...", action: #selector(menuInsertPDF), keyEquivalent: "i")
         fileMenu.addItem(withTitle: "Export Annotated PDF...", action: #selector(menuExportPDF), keyEquivalent: "e")
         fileMenu.addItem(NSMenuItem.separator())
@@ -500,6 +537,8 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
         let redoItem = NSMenuItem(title: "Redo", action: #selector(menuRedo), keyEquivalent: "Z")
         redoItem.keyEquivalentModifierMask = [.command, .shift]
         editMenu.addItem(redoItem)
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(withTitle: "Paste", action: #selector(menuPaste), keyEquivalent: "v")
         editMenu.addItem(NSMenuItem.separator())
         editMenu.addItem(withTitle: "Clear Whiteboard", action: #selector(menuClearAll), keyEquivalent: "k")
         editMenuItem.submenu = editMenu
@@ -552,8 +591,16 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
         currentWindowController?.saveBoardDialog(saveAs: true)
     }
 
+    @objc private func menuInsertImage() {
+        currentWindowController?.promptInsertImage()
+    }
+
     @objc private func menuInsertPDF() {
         currentWindowController?.promptInsertPDF()
+    }
+
+    @objc private func menuPaste() {
+        currentWindowController?.canvasView.paste(nil)
     }
 
     @objc private func menuExportPDF() {
