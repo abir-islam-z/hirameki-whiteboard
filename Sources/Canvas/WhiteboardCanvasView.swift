@@ -43,6 +43,13 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
     public var activeTool: Tool = .select {
         didSet {
             freeformState.activeTool = activeTool
+            if activeTool == .eraser {
+                Self.eraserCursor.set()
+            } else {
+                isErasingActive = false
+                eraserTrail.removeAll()
+            }
+            needsDisplay = true
             window?.invalidateCursorRects(for: self)
             if activeTool != .select {
                 clearSelection()
@@ -129,6 +136,41 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
     // Text Editing
     private var activeTextField: NSTextField?
     private var editingStrokeIndex: Int?
+
+    // Eraser Pointer Movement Tracking
+    private var trackingArea: NSTrackingArea?
+    private var currentCursorPoint: CGPoint?
+    private var isErasingActive: Bool = false
+    private var eraserTrail: [(point: CGPoint, time: TimeInterval)] = []
+
+    public override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let ta = trackingArea {
+            removeTrackingArea(ta)
+        }
+        let options: NSTrackingArea.Options = [.activeAlways, .mouseMoved, .mouseEnteredAndExited, .cursorUpdate]
+        let ta = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
+        addTrackingArea(ta)
+        self.trackingArea = ta
+    }
+
+    public override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        let screenPt = convert(event.locationInWindow, from: nil)
+        currentCursorPoint = screenPt
+        if activeTool == .eraser {
+            needsDisplay = true
+        }
+    }
+
+    public override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        if activeTool == .eraser {
+            currentCursorPoint = nil
+            eraserTrail.removeAll()
+            needsDisplay = true
+        }
+    }
 
     // Floating UI Hosting Views
     private var freeformBottomLeftHost: NSHostingView<FreeformWhiteboardBottomLeftBar>?
@@ -230,6 +272,11 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
             return hit
         }
         return self
+    }
+
+    public override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.acceptsMouseMovedEvents = true
     }
 
     // MARK: - Multi-Page Switching
@@ -567,6 +614,11 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
         }
 
         ctx.restoreGState()
+
+        // Live Eraser Movement Tracker (reticle & dynamic swipe track)
+        if activeTool == .eraser, let cursor = currentCursorPoint {
+            drawEraserMovementTracker(at: cursor, in: ctx)
+        }
     }
 
     private func drawDotsPattern(in ctx: CGContext) {
@@ -925,7 +977,12 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
         }
 
         if activeTool == .eraser {
+            isErasingActive = true
+            currentCursorPoint = screenPt
+            eraserTrail = [(point: screenPt, time: Date().timeIntervalSince1970)]
+            Self.eraserCursor.set()
             eraseAt(canvasPt)
+            needsDisplay = true
             return
         }
 
@@ -1055,7 +1112,14 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
     }
 
         if activeTool == .eraser {
+            isErasingActive = true
+            currentCursorPoint = screenPt
+            let now = Date().timeIntervalSince1970
+            eraserTrail.append((point: screenPt, time: now))
+            eraserTrail.removeAll { now - $0.time > 0.40 }
+            Self.eraserCursor.set()
             eraseAt(canvasPt)
+            needsDisplay = true
             return
         }
 
@@ -1074,6 +1138,12 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
     }
 
     public override func mouseUp(with event: NSEvent) {
+        if isErasingActive {
+            isErasingActive = false
+            eraserTrail.removeAll()
+            needsDisplay = true
+        }
+
         if isDraggingPan {
             isDraggingPan = false
             return
@@ -1248,6 +1318,85 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
             canvasDelegate?.canvasDidUpdateDocument(document)
             needsDisplay = true
         }
+    }
+
+    // MARK: - Eraser Movement Tracker Rendering
+    private func drawEraserMovementTracker(at pt: CGPoint, in ctx: CGContext) {
+        let eraserRadius: CGFloat = 20.0
+        let eraserRect = CGRect(x: pt.x - eraserRadius, y: pt.y - eraserRadius, width: eraserRadius * 2.0, height: eraserRadius * 2.0)
+
+        ctx.saveGState()
+
+        // 1. Draw dynamic motion track (recent swipe path trail)
+        let now = Date().timeIntervalSince1970
+        let validTrail = eraserTrail.filter { now - $0.time < 0.35 }
+        if validTrail.count >= 2 {
+            for i in 1..<validTrail.count {
+                let p0 = validTrail[i - 1].point
+                let p1 = validTrail[i].point
+                let progress = CGFloat(i) / CGFloat(validTrail.count)
+                let age = now - validTrail[i].time
+                let alpha = max(0.0, 1.0 - (age / 0.35)) * progress
+
+                ctx.setLineCap(.round)
+                // Outer subtle trail shadow
+                ctx.setStrokeColor(NSColor.black.withAlphaComponent(Double(alpha * 0.15)).cgColor)
+                ctx.setLineWidth((eraserRadius * 1.5) * (0.4 + 0.6 * progress) + 2)
+                ctx.move(to: p0)
+                ctx.addLine(to: p1)
+                ctx.strokePath()
+
+                // Glowing motion track
+                let trackColor = (eraserType == .object)
+                    ? NSColor.systemPink.withAlphaComponent(Double(alpha * 0.35))
+                    : NSColor.systemBlue.withAlphaComponent(Double(alpha * 0.35))
+                ctx.setStrokeColor(trackColor.cgColor)
+                ctx.setLineWidth((eraserRadius * 1.5) * (0.4 + 0.6 * progress))
+                ctx.move(to: p0)
+                ctx.addLine(to: p1)
+                ctx.strokePath()
+            }
+        }
+
+        // 2. Erasing reticle at current cursor point
+        if isErasingActive {
+            // Active erasing: pulsing highlight disc & glowing border
+            let activeColor = (eraserType == .object) ? NSColor.systemPink : NSColor.systemBlue
+            ctx.setFillColor(activeColor.withAlphaComponent(0.18).cgColor)
+            ctx.fillEllipse(in: eraserRect)
+
+            ctx.setStrokeColor(activeColor.withAlphaComponent(0.90).cgColor)
+            ctx.setLineWidth(2.2)
+            ctx.strokeEllipse(in: eraserRect)
+
+            // Contact center dot
+            let centerDot = CGRect(x: pt.x - 3, y: pt.y - 3, width: 6, height: 6)
+            ctx.setFillColor(activeColor.cgColor)
+            ctx.fillEllipse(in: centerDot)
+        } else {
+            // Hover movement tracker: dual-ring for contrast against white, dark, or patterned canvas
+            ctx.setFillColor(NSColor.black.withAlphaComponent(0.04).cgColor)
+            ctx.fillEllipse(in: eraserRect)
+
+            // Outer dark ring
+            ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.40).cgColor)
+            ctx.setLineWidth(1.4)
+            ctx.strokeEllipse(in: eraserRect.insetBy(dx: -0.5, dy: -0.5))
+
+            // Inner crisp dashed ring
+            let ringColor = (eraserType == .object) ? NSColor.systemPink : NSColor.systemBlue
+            ctx.setStrokeColor(ringColor.withAlphaComponent(0.85).cgColor)
+            ctx.setLineWidth(1.6)
+            ctx.setLineDash(phase: 0, lengths: [4, 3])
+            ctx.strokeEllipse(in: eraserRect)
+
+            // Center target crosshair pip
+            let centerDot = CGRect(x: pt.x - 2, y: pt.y - 2, width: 4, height: 4)
+            ctx.setFillColor(ringColor.withAlphaComponent(0.9).cgColor)
+            ctx.fillEllipse(in: centerDot)
+        }
+
+        ctx.restoreGState()
     }
 
     // MARK: - Laser Fade Animation Loop
@@ -1680,6 +1829,116 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
         super.keyUp(with: event)
     }
 
+    // MARK: - Dedicated Vector Cursors
+    private static let eraserCursor: NSCursor = {
+        let size: CGFloat = 32
+        let hotSpot = NSPoint(x: 21, y: 21) // Contact point near the erasing tip
+        let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+
+            ctx.saveGState()
+
+            // Motion Track: Speed lines trailing behind the eraser towards upper-left
+            let trackAngle: CGFloat = .pi * 0.75 // 135 degrees (towards top-left)
+            let dx = cos(trackAngle)
+            let dy = sin(trackAngle)
+
+            ctx.setLineCap(.round)
+
+            // 3 Speed lines
+            let lines: [(offset: CGFloat, len: CGFloat, width: CGFloat, alpha: CGFloat)] = [
+                (offset: -5.0, len: 10.0, width: 1.8, alpha: 0.85),
+                (offset:  0.0, len: 13.0, width: 2.2, alpha: 1.00),
+                (offset:  5.0, len:  9.5, width: 1.8, alpha: 0.80)
+            ]
+
+            let trackOrigin = CGPoint(x: 14.0, y: 14.0)
+            let perpX = -dy
+            let perpY = dx
+
+            // Soft motion wash
+            let wash = CGMutablePath()
+            wash.move(to: CGPoint(x: 18, y: 18))
+            wash.addLine(to: CGPoint(x: 18 + perpX * 8, y: 18 + perpY * 8))
+            wash.addLine(to: CGPoint(x: 18 + perpX * 8 + dx * 12, y: 18 + perpY * 8 + dy * 12))
+            wash.addLine(to: CGPoint(x: 18 + dx * 10, y: 18 + dy * 10))
+            wash.closeSubpath()
+            ctx.setFillColor(NSColor(red: 0.35, green: 0.65, blue: 1.0, alpha: 0.16).cgColor)
+            ctx.addPath(wash)
+            ctx.fillPath()
+
+            // Crisp dual-layer speed lines
+            for l in lines {
+                let p1 = CGPoint(x: trackOrigin.x + perpX * l.offset, y: trackOrigin.y + perpY * l.offset)
+                let p2 = CGPoint(x: p1.x + dx * l.len, y: p1.y + dy * l.len)
+
+                // Dark border for contrast on white canvas
+                ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.40).cgColor)
+                ctx.setLineWidth(l.width + 1.2)
+                ctx.move(to: p1); ctx.addLine(to: p2); ctx.strokePath()
+
+                // Vibrant cyan/blue motion stroke
+                ctx.setStrokeColor(NSColor(red: 0.30, green: 0.62, blue: 1.0, alpha: l.alpha).cgColor)
+                ctx.setLineWidth(l.width)
+                ctx.move(to: p1); ctx.addLine(to: p2); ctx.strokePath()
+            }
+
+            // ── Rubber Eraser Block ──
+            ctx.saveGState()
+            ctx.translateBy(x: 18, y: 14)
+            ctx.rotate(by: -.pi / 4) // -45 degrees
+
+            let bW: CGFloat = 18.0
+            let bH: CGFloat = 11.5
+            let bR: CGFloat = 2.4
+            let blockRect = CGRect(x: -bW/2, y: -bH/2, width: bW, height: bH)
+            let blockPath = CGPath(roundedRect: blockRect, cornerWidth: bR, cornerHeight: bR, transform: nil)
+
+            // 3D drop shadow
+            ctx.setShadow(offset: CGSize(width: 0.6, height: -1.2), blur: 2.5, color: NSColor.black.withAlphaComponent(0.45).cgColor)
+            ctx.addPath(blockPath)
+            ctx.setFillColor(NSColor.white.cgColor)
+            ctx.fillPath()
+            ctx.setShadow(offset: .zero, blur: 0, color: nil)
+
+            // Inner clipping for pink band and sleeve
+            ctx.saveGState()
+            ctx.addPath(blockPath)
+            ctx.clip()
+
+            // White rubber body is already filled
+            // Pink rubber end on the trailing left side
+            let pinkW = bW * 0.42
+            let pinkRect = CGRect(x: -bW/2, y: -bH/2, width: pinkW, height: bH)
+            ctx.setFillColor(NSColor(red: 1.0, green: 0.50, blue: 0.55, alpha: 1.0).cgColor)
+            ctx.fill(pinkRect)
+
+            // Classic blue cardboard band in middle
+            let sleeveW = bW * 0.28
+            let sleeveRect = CGRect(x: -bW/2 + pinkW * 0.7, y: -bH/2, width: sleeveW, height: bH)
+            ctx.setFillColor(NSColor(red: 0.18, green: 0.45, blue: 0.90, alpha: 1.0).cgColor)
+            ctx.fill(sleeveRect)
+
+            // White accent line on sleeve
+            let stripeRect = CGRect(x: -bW/2 + pinkW * 0.7 + sleeveW * 0.4, y: -bH/2, width: 1.4, height: bH)
+            ctx.setFillColor(NSColor.white.withAlphaComponent(0.9).cgColor)
+            ctx.fill(stripeRect)
+
+            ctx.restoreGState()
+
+            // Crisp outline
+            ctx.addPath(blockPath)
+            ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.85).cgColor)
+            ctx.setLineWidth(1.2)
+            ctx.strokePath()
+
+            ctx.restoreGState() // from block
+            ctx.restoreGState() // from canvas
+            return true
+        }
+        return NSCursor(image: img, hotSpot: hotSpot)
+    }()
+
     public override func resetCursorRects() {
         super.resetCursorRects()
         let cursor: NSCursor
@@ -1687,7 +1946,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
         case .select: cursor = .arrow
         case .hand: cursor = isDraggingPan ? .closedHand : .openHand
         case .pen, .highlighter, .laser: cursor = .crosshair
-        case .eraser: cursor = .disappearingItem
+        case .eraser: cursor = Self.eraserCursor
         case .text: cursor = .iBeam
         case .note: cursor = .pointingHand
         default: cursor = .crosshair
@@ -1699,6 +1958,9 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
     public func freeformDidSelectTool(_ tool: Tool) {
         self.activeTool = tool
         self.freeformState.activeTool = tool
+        if tool == .eraser {
+            Self.eraserCursor.set()
+        }
         window?.invalidateCursorRects(for: self)
     }
 

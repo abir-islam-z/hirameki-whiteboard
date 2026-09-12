@@ -99,6 +99,7 @@ public final class WhiteboardWindow: NSWindow {
         backgroundColor = .white
         hasShadow = true
         minSize = NSSize(width: 820, height: 540)
+        acceptsMouseMovedEvents = true
 
         // Attach native unified toolbar
         let tbDelegate = WhiteboardToolbarDelegate(canvasView: canvasView)
