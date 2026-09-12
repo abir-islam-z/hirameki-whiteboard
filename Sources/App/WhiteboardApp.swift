@@ -317,8 +317,7 @@ public final class WhiteboardWindowController: NSWindowController, NSWindowDeleg
         window.titlebarAppearsTransparent = true
         window.backgroundColor = .white
         window.isOpaque = true
-        window.center()
-
+        window.isReleasedWhenClosed = false
         super.init(window: window)
         window.delegate = self
         self.viewModel.window = window
@@ -378,10 +377,17 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.delegate as! WhiteboardAppDelegate
     }
 
+    public static func main() {
+        let app = NSApplication.shared
+        let delegate = WhiteboardAppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.regular)
+        app.run()
+    }
+
     private var windowControllers: [WhiteboardWindowController] = []
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApplication.shared.setActivationPolicy(.regular)
         setupMainMenu()
         createNewBoard()
         NSApplication.shared.activate(ignoringOtherApps: true)
@@ -421,6 +427,9 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
         let winCtrl = WhiteboardWindowController()
         windowControllers.append(winCtrl)
         winCtrl.showWindow(self)
+        winCtrl.window?.center()
+        winCtrl.window?.makeKeyAndOrderFront(nil)
+        winCtrl.window?.orderFrontRegardless()
         return winCtrl
     }
 
