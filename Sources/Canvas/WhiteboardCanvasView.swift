@@ -1,31 +1,66 @@
 import AppKit
 import UniformTypeIdentifiers
 import PDFKit
+import SwiftUI
 
 public protocol WhiteboardCanvasDelegate: AnyObject {
     func canvasDidUpdateDocument(_ doc: WhiteboardDocument)
     func canvasDidRequestNewPage()
     func canvasDidRequestInsertPDF()
+    func canvasDidRequestSave()
+    func canvasDidRequestSaveAs()
+    func canvasDidRequestOpen()
+    func canvasDidRequestExportPDF()
+    func canvasDidRequestNewBoard()
 }
 
-public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFieldDelegate {
+public enum ResizeHandle: String, CaseIterable, Equatable {
+    case topLeft
+    case top
+    case topRight
+    case right
+    case bottomRight
+    case bottom
+    case bottomLeft
+    case left
+}
+
+private enum TransformMode: Equatable {
+    case none
+    case moving
+    case resizing(handle: ResizeHandle, anchor: CGPoint, initialBounds: CGRect)
+}
+
+public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFieldDelegate, FreeformWhiteboardActionDelegate {
     public var document: WhiteboardDocument
     public weak var canvasDelegate: WhiteboardCanvasDelegate?
 
-    public var onToolChanged: ((Tool) -> Void)?
-    public var onZoomChanged: ((CGFloat) -> Void)?
+    public let freeformState = FreeformWhiteboardState()
 
-    public var activeTool: Tool = .pen {
+    public var activeTool: Tool = .select {
         didSet {
+            freeformState.activeTool = activeTool
             window?.invalidateCursorRects(for: self)
             if activeTool != .select {
                 clearSelection()
             }
-            onToolChanged?(activeTool)
         }
     }
-    public var activeColor: NSColor = .black
-    public var activeWidth: CGFloat = 4.0
+    public var activeColor: NSColor = .black {
+        didSet {
+            freeformState.activeColor = Color(activeColor)
+        }
+    }
+    public var activeWidth: CGFloat = 4.0 {
+        didSet {
+            freeformState.activeWidth = activeWidth
+        }
+    }
+    public var eraserType: EraserType = .object {
+        didSet {
+            freeformState.eraserType = eraserType
+        }
+    }
 
     // Canvas Transformation
     public var panOffset: CGPoint = .zero {
@@ -37,9 +72,9 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     public var zoomScale: CGFloat = 1.0 {
         didSet {
             zoomScale = max(0.1, min(5.0, zoomScale))
+            freeformState.zoomScale = zoomScale
             updateTransform()
             needsDisplay = true
-            onZoomChanged?(zoomScale)
         }
     }
 
@@ -48,12 +83,22 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     private var redoStack: [Stroke] = []
     public var selectedStrokeIndex: Int?
 
+    // Interactive Transformation
+    private var transformMode: TransformMode = .none
+    private var initialStrokePoints: [StrokePoint] = []
+    private var dragStartPos: CGPoint = .zero
+    private var hasMovedSignificantly: Bool = false
+
     // Spacebar Pan State
     private var isSpacebarPanActive: Bool = false
     private var toolBeforeSpacebarPan: Tool = .select
     private var isDraggingPan: Bool = false
     private var dragPanStartMouse: CGPoint = .zero
     private var dragPanStartOffset: CGPoint = .zero
+
+    // Laser fading & Disappearing Ink
+    private var laserStrokes: [(stroke: Stroke, fadeStartTime: TimeInterval)] = []
+    private var laserDisplayTimer: Timer?
 
     // Child PDF item views
     private var pdfItemViews: [UUID: PDFCanvasItemView] = [:]
@@ -62,12 +107,18 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     private var activeTextField: NSTextField?
     private var editingStrokeIndex: Int?
 
+    // Floating UI Hosting Views
+    private var freeformBottomLeftHost: NSHostingView<FreeformWhiteboardBottomLeftBar>?
+    private var pageBarHost: NSHostingView<PageNavigationBar>?
+
     public init(frame: NSRect, document: WhiteboardDocument = WhiteboardDocument()) {
         self.document = document
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.white.cgColor
         registerForDraggedTypes([.fileURL])
+
+        setupFloatingBars()
         loadCurrentPage()
     }
 
@@ -75,12 +126,142 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         fatalError("init(coder:) has not been implemented")
     }
 
+    // MARK: - Floating UI Setup & Layout
+    private func setupFloatingBars() {
+        freeformState.documentTitle = document.title
+        freeformState.activeTool = activeTool
+        freeformState.activeColor = Color(activeColor)
+        freeformState.activeWidth = activeWidth
+        freeformState.zoomScale = zoomScale
+        freeformState.eraserType = eraserType
+        freeformState.pattern = document.activePage.pattern
+        freeformState.boardOpacity = 1.0
+
+        // 1. Bottom-Left Zoom & Undo/Redo capsule
+        let blView = FreeformWhiteboardBottomLeftBar(state: freeformState, delegate: self)
+        let blHost = NSHostingView(rootView: blView)
+        blHost.autoresizingMask = []
+        blHost.wantsLayer = true
+        blHost.layer?.zPosition = 1000
+        addSubview(blHost)
+        self.freeformBottomLeftHost = blHost
+
+        // 2. Multi-Page Navigation Bar
+        let pageView = PageNavigationBar(
+            document: Binding(
+                get: { [weak self] in self?.document ?? WhiteboardDocument() },
+                set: { [weak self] newDoc in
+                    self?.document = newDoc
+                    self?.canvasDelegate?.canvasDidUpdateDocument(newDoc)
+                }
+            ),
+            onSelectPage: { [weak self] idx in self?.switchToPage(at: idx) },
+            onAddPage: { [weak self] in self?.addNewPage() },
+            onDuplicatePage: { [weak self] idx in self?.duplicatePage(at: idx) },
+            onDeletePage: { [weak self] idx in self?.deletePage(at: idx) },
+            onRenamePage: { [weak self] idx, name in self?.renamePage(at: idx, to: name) },
+            onZoomIn: { [weak self] in self?.zoomIn() },
+            onZoomOut: { [weak self] in self?.zoomOut() },
+            onResetZoom: { [weak self] in self?.resetZoom() },
+            currentZoom: zoomScale
+        )
+        let pHost = NSHostingView(rootView: pageView)
+        pHost.autoresizingMask = []
+        pHost.wantsLayer = true
+        pHost.layer?.zPosition = 1000
+        addSubview(pHost)
+        self.pageBarHost = pHost
+
+        layoutFloatingBars()
+    }
+
+    public override func resizeSubviews(withOldSize oldSize: NSSize) {
+        super.resizeSubviews(withOldSize: oldSize)
+        layoutFloatingBars()
+    }
+
+    private func layoutFloatingBars() {
+        let padX: CGFloat = 20
+        let padY: CGFloat = 20
+
+        if let bl = freeformBottomLeftHost {
+            let size = bl.fittingSize
+            let w = max(260, size.width)
+            let h = max(34, size.height)
+            bl.frame = NSRect(x: padX, y: padY, width: w, height: h)
+        }
+
+        if let pHost = pageBarHost {
+            let size = pHost.fittingSize
+            let w = max(260, size.width)
+            let h = max(34, size.height)
+            let blWidth = freeformBottomLeftHost?.frame.width ?? 260
+            pHost.frame = NSRect(x: padX + blWidth + 12, y: padY, width: w, height: h)
+        }
+    }
+
+    public override func hitTest(_ point: NSPoint) -> NSView? {
+        // Forward touches to bottom left bar if clicked inside
+        if let bl = freeformBottomLeftHost, bl.frame.contains(point) {
+            let local = convert(point, to: bl)
+            return bl.hitTest(local)
+        }
+        // Forward touches to page bar if clicked inside
+        if let pHost = pageBarHost, pHost.frame.contains(point) {
+            let local = convert(point, to: pHost)
+            return pHost.hitTest(local)
+        }
+        // Forward to active text editor if active
+        if let editor = activeTextField, editor.frame.contains(point) {
+            return editor
+        }
+        // Forward to PDF items if clicked inside
+        for (_, pdfView) in pdfItemViews {
+            if pdfView.frame.contains(point) {
+                let local = convert(point, to: pdfView)
+                return pdfView.hitTest(local)
+            }
+        }
+        // All other canvas points return self directly
+        return self
+    }
+
     // MARK: - Multi-Page Switching
     public func switchToPage(at index: Int) {
+        commitActiveTextEditor()
+        clearSelection()
         saveCurrentPageState()
         document.activePageIndex = max(0, min(index, document.pages.count - 1))
         loadCurrentPage()
         canvasDelegate?.canvasDidUpdateDocument(document)
+    }
+
+    public func addNewPage() {
+        commitActiveTextEditor()
+        clearSelection()
+        let newIndex = document.addPage()
+        switchToPage(at: newIndex)
+    }
+
+    public func duplicatePage(at index: Int) {
+        commitActiveTextEditor()
+        clearSelection()
+        let newIndex = document.duplicatePage(at: index)
+        switchToPage(at: newIndex)
+    }
+
+    public func deletePage(at index: Int) {
+        commitActiveTextEditor()
+        clearSelection()
+        document.deletePage(at: index)
+        loadCurrentPage()
+        canvasDelegate?.canvasDidUpdateDocument(document)
+    }
+
+    public func renamePage(at index: Int, to newName: String) {
+        document.renamePage(at: index, to: newName)
+        canvasDelegate?.canvasDidUpdateDocument(document)
+        needsDisplay = true
     }
 
     private func saveCurrentPageState() {
@@ -91,7 +272,6 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     }
 
     public func loadCurrentPage() {
-        // Clear old PDF item views from canvas
         for (_, view) in pdfItemViews {
             view.removeFromSuperview()
         }
@@ -100,10 +280,11 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         let page = document.activePage
         self.panOffset = page.panOffset
         self.zoomScale = page.zoomScale == 0 ? 1.0 : page.zoomScale
+        self.freeformState.zoomScale = self.zoomScale
+        self.freeformState.pattern = page.pattern
         self.redoStack.removeAll()
         self.selectedStrokeIndex = nil
 
-        // Add PDF item views for this page
         for pdf in page.embeddedPDFs {
             addPDFItemView(pdf)
         }
@@ -116,7 +297,11 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         let itemView = PDFCanvasItemView(embeddedPDF: pdf)
         itemView.delegate = self
         pdfItemViews[pdf.id] = itemView
-        addSubview(itemView)
+        if let bl = freeformBottomLeftHost {
+            addSubview(itemView, positioned: .below, relativeTo: bl)
+        } else {
+            addSubview(itemView)
+        }
         layoutPDFItem(itemView)
     }
 
@@ -197,13 +382,17 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
-        // Background
-        ctx.setFillColor(NSColor.white.cgColor)
+        // Background with Opacity
+        let bgOpacity = freeformState.boardOpacity
+        ctx.setFillColor(NSColor.white.withAlphaComponent(bgOpacity).cgColor)
         ctx.fill(bounds)
 
-        // Subtle Pattern (Dots)
-        if document.activePage.pattern == "dots" {
+        // Subtle Pattern
+        let pattern = freeformState.pattern
+        if pattern == "dots" {
             drawDotsPattern(in: ctx)
+        } else if pattern == "grid" {
+            drawGridPattern(in: ctx)
         }
 
         ctx.saveGState()
@@ -211,8 +400,9 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         ctx.translateBy(x: panOffset.x, y: panOffset.y)
         ctx.scaleBy(x: zoomScale, y: zoomScale)
 
-        // Draw Completed Strokes
+        // Draw Completed Page Strokes
         for (idx, stroke) in document.activePage.strokes.enumerated() {
+            if idx == editingStrokeIndex { continue }
             drawStroke(stroke, in: ctx, isSelected: idx == selectedStrokeIndex)
         }
 
@@ -221,12 +411,30 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             drawStroke(stroke, in: ctx, isSelected: false)
         }
 
+        // Draw Selection Bounding Box with 8 Handles and Delete Button
+        if activeTool == .select, let selIdx = selectedStrokeIndex, selIdx < document.activePage.strokes.count, selIdx != editingStrokeIndex {
+            drawSelectionBoundingBox(for: selIdx, in: ctx)
+        }
+
+        // Draw Vanishing Laser Strokes
+        let now = Date().timeIntervalSince1970
+        for item in laserStrokes {
+            let elapsed = now - item.fadeStartTime
+            let progress = min(1.0, max(0.0, elapsed / 2.2))
+            let alpha = pow(1.0 - progress, 1.25)
+            if alpha > 0.005 {
+                var faded = item.stroke
+                faded.opacity = CGFloat(alpha)
+                drawLaserStroke(faded, in: ctx)
+            }
+        }
+
         ctx.restoreGState()
     }
 
     private func drawDotsPattern(in ctx: CGContext) {
         let dotSpacing: CGFloat = 28.0 * zoomScale
-        guard dotSpacing >= 12 else { return }
+        guard dotSpacing >= 10 else { return }
 
         ctx.setFillColor(NSColor(white: 0.85, alpha: 1.0).cgColor)
         let startX = panOffset.x.truncatingRemainder(dividingBy: dotSpacing)
@@ -240,6 +448,29 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
                 y += dotSpacing
             }
             x += dotSpacing
+        }
+    }
+
+    private func drawGridPattern(in ctx: CGContext) {
+        let gridSpacing: CGFloat = 32.0 * zoomScale
+        guard gridSpacing >= 12 else { return }
+
+        ctx.setStrokeColor(NSColor(white: 0.90, alpha: 1.0).cgColor)
+        ctx.setLineWidth(1.0)
+
+        let startX = panOffset.x.truncatingRemainder(dividingBy: gridSpacing)
+        let startY = panOffset.y.truncatingRemainder(dividingBy: gridSpacing)
+
+        var x = startX
+        while x < bounds.width {
+            ctx.strokeLineSegments(between: [CGPoint(x: x, y: 0), CGPoint(x: x, y: bounds.height)])
+            x += gridSpacing
+        }
+
+        var y = startY
+        while y < bounds.height {
+            ctx.strokeLineSegments(between: [CGPoint(x: 0, y: y), CGPoint(x: bounds.width, y: y)])
+            y += gridSpacing
         }
     }
 
@@ -274,7 +505,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
                 ctx.strokePath()
             }
 
-            let size = max(16, (stroke.fontSize ?? 20.0))
+            let size = max(14, (stroke.fontSize ?? 18.0))
             let font: NSFont = (stroke.isBold == true) ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size, weight: .medium)
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: font,
@@ -283,9 +514,6 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             let inset: CGFloat = stroke.tool == .note ? 14.0 : 0.0
             (text as NSString).draw(at: CGPoint(x: p.x + inset, y: p.y + inset), withAttributes: attrs)
 
-            if isSelected {
-                drawSelectionBoundingBox(stroke.bounds, in: ctx)
-            }
             ctx.restoreGState()
             return
         }
@@ -304,20 +532,122 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             ctx.strokePath()
         }
 
-        if isSelected {
-            drawSelectionBoundingBox(stroke.bounds, in: ctx)
+        ctx.restoreGState()
+    }
+
+    private func drawLaserStroke(_ stroke: Stroke, in ctx: CGContext) {
+        guard stroke.points.count >= 2 else { return }
+        ctx.saveGState()
+
+        let baseColor = stroke.nsColor.withAlphaComponent(stroke.opacity)
+        ctx.setStrokeColor(baseColor.cgColor)
+        ctx.setLineWidth(stroke.width * 1.5)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        ctx.setShadow(offset: .zero, blur: 8.0, color: baseColor.cgColor)
+
+        let path = CGMutablePath()
+        path.move(to: stroke.points[0].cgPoint)
+        for i in 1..<stroke.points.count {
+            path.addLine(to: stroke.points[i].cgPoint)
         }
+        ctx.addPath(path)
+        ctx.strokePath()
+
+        // Inner bright core
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(stroke.opacity).cgColor)
+        ctx.setLineWidth(max(2.0, stroke.width * 0.5))
+        ctx.addPath(path)
+        ctx.strokePath()
 
         ctx.restoreGState()
     }
 
-    private func drawSelectionBoundingBox(_ box: CGRect, in ctx: CGContext) {
+    // MARK: - Selection Bounding Box & 8 Handles
+    private func drawSelectionBoundingBox(for index: Int, in ctx: CGContext) {
+        guard index < document.activePage.strokes.count else { return }
+        let stroke = document.activePage.strokes[index]
+        let b = stroke.bounds
+        guard b.width > 0 && b.height > 0 else { return }
+
+        ctx.saveGState()
         let pad: CGFloat = 6.0
-        let selRect = box.insetBy(dx: -pad, dy: -pad)
-        ctx.setStrokeColor(NSColor.systemBlue.cgColor)
+        let selRect = b.insetBy(dx: -pad, dy: -pad)
+
+        if stroke.tool == .text || stroke.tool == .note {
+            // Freeform solid outline
+            ctx.setLineDash(phase: 0, lengths: [])
+            ctx.setStrokeColor(NSColor.systemBlue.cgColor)
+            ctx.setLineWidth(1.5 / zoomScale)
+            let path = CGPath(roundedRect: selRect, cornerWidth: 6, cornerHeight: 6, transform: nil)
+            ctx.addPath(path)
+            ctx.strokePath()
+
+            ctx.setFillColor(NSColor.systemBlue.withAlphaComponent(0.04).cgColor)
+            ctx.addPath(path)
+            ctx.fillPath()
+        } else {
+            // Dashed selection box
+            ctx.setStrokeColor(NSColor.systemBlue.cgColor)
+            ctx.setLineWidth(1.5 / zoomScale)
+            let dash: [CGFloat] = [5 / zoomScale, 3 / zoomScale]
+            ctx.setLineDash(phase: 0, lengths: dash)
+            ctx.stroke(selRect)
+        }
+
+        // Draw 8 circular resize handles
+        let handleRadius: CGFloat = 4.5 / zoomScale
+        let handleDiameter = handleRadius * 2
+
+        ctx.setLineDash(phase: 0, lengths: [])
+        for handle in ResizeHandle.allCases {
+            let r = handleRect(for: handle, in: selRect, diameter: handleDiameter)
+            ctx.setFillColor(NSColor.white.cgColor)
+            ctx.fillEllipse(in: r)
+            ctx.setStrokeColor(NSColor.systemBlue.cgColor)
+            ctx.setLineWidth(1.5 / zoomScale)
+            ctx.strokeEllipse(in: r)
+        }
+
+        // Draw Delete Pill Button above top-right corner
+        let delSize: CGFloat = 20.0 / zoomScale
+        let delRect = CGRect(x: selRect.maxX - delSize / 2, y: selRect.maxY + 6 / zoomScale, width: delSize, height: delSize)
+        ctx.setFillColor(NSColor.systemRed.cgColor)
+        ctx.fillEllipse(in: delRect)
+        ctx.setStrokeColor(NSColor.white.cgColor)
         ctx.setLineWidth(1.5 / zoomScale)
-        ctx.setLineDash(phase: 0, lengths: [4 / zoomScale, 4 / zoomScale])
-        ctx.stroke(selRect)
+        let crossInset: CGFloat = 5.0 / zoomScale
+        ctx.strokeLineSegments(between: [
+            CGPoint(x: delRect.minX + crossInset, y: delRect.minY + crossInset),
+            CGPoint(x: delRect.maxX - crossInset, y: delRect.maxY - crossInset)
+        ])
+        ctx.strokeLineSegments(between: [
+            CGPoint(x: delRect.minX + crossInset, y: delRect.maxY - crossInset),
+            CGPoint(x: delRect.maxX - crossInset, y: delRect.minY + crossInset)
+        ])
+
+        ctx.restoreGState()
+    }
+
+    private func handleRect(for handle: ResizeHandle, in rect: CGRect, diameter: CGFloat) -> CGRect {
+        let r = diameter / 2.0
+        let pt: CGPoint
+        switch handle {
+        case .topLeft: pt = CGPoint(x: rect.minX, y: rect.maxY)
+        case .top: pt = CGPoint(x: rect.midX, y: rect.maxY)
+        case .topRight: pt = CGPoint(x: rect.maxX, y: rect.maxY)
+        case .right: pt = CGPoint(x: rect.maxX, y: rect.midY)
+        case .bottomRight: pt = CGPoint(x: rect.maxX, y: rect.minY)
+        case .bottom: pt = CGPoint(x: rect.midX, y: rect.minY)
+        case .bottomLeft: pt = CGPoint(x: rect.minX, y: rect.minY)
+        case .left: pt = CGPoint(x: rect.minX, y: rect.midY)
+        }
+        return CGRect(x: pt.x - r, y: pt.y - r, width: diameter, height: diameter)
+    }
+
+    private func deleteButtonRect(for selRect: CGRect) -> CGRect {
+        let delSize: CGFloat = 20.0 / zoomScale
+        return CGRect(x: selRect.maxX - delSize / 2, y: selRect.maxY + 6 / zoomScale, width: delSize, height: delSize)
     }
 
     // MARK: - Mouse Events
@@ -334,7 +664,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         }
 
         if activeTool == .select {
-            handleSelectMouseDown(at: canvasPt)
+            handleSelectMouseDown(at: canvasPt, clickCount: event.clickCount)
             return
         }
 
@@ -353,13 +683,14 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             return
         }
 
-        // Start drawing stroke
+        // Start drawing stroke or laser
         let pt = StrokePoint(x: canvasPt.x, y: canvasPt.y, pressure: CGFloat(event.pressure))
+        let width = activeWidth / (activeTool == .highlighter ? 1.0 : zoomScale)
         currentStroke = Stroke(
             tool: activeTool,
             points: [pt],
             colorHex: activeColor.hexString,
-            width: activeWidth / (activeTool == .highlighter ? 1.0 : zoomScale)
+            width: width
         )
         needsDisplay = true
     }
@@ -376,6 +707,65 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             return
         }
 
+        if activeTool == .select, let selIdx = selectedStrokeIndex, selIdx < document.activePage.strokes.count {
+            switch transformMode {
+            case .moving:
+                let deltaX = canvasPt.x - dragStartPos.x
+                let deltaY = canvasPt.y - dragStartPos.y
+                for i in 0..<document.activePage.strokes[selIdx].points.count {
+                    if i < initialStrokePoints.count {
+                        document.activePage.strokes[selIdx].points[i].x = initialStrokePoints[i].x + deltaX
+                        document.activePage.strokes[selIdx].points[i].y = initialStrokePoints[i].y + deltaY
+                    }
+                }
+                hasMovedSignificantly = true
+                needsDisplay = true
+                return
+
+            case .resizing(let handle, let anchor, let initBounds):
+                let initW = max(1.0, initBounds.width)
+                let initH = max(1.0, initBounds.height)
+                var newW: CGFloat = initW
+                var newH: CGFloat = initH
+
+                switch handle {
+                case .right: newW = max(10.0, canvasPt.x - anchor.x)
+                case .left: newW = max(10.0, anchor.x - canvasPt.x)
+                case .top: newH = max(10.0, canvasPt.y - anchor.y)
+                case .bottom: newH = max(10.0, anchor.y - canvasPt.y)
+                case .topRight:
+                    newW = max(10.0, canvasPt.x - anchor.x)
+                    newH = max(10.0, canvasPt.y - anchor.y)
+                case .topLeft:
+                    newW = max(10.0, anchor.x - canvasPt.x)
+                    newH = max(10.0, canvasPt.y - anchor.y)
+                case .bottomRight:
+                    newW = max(10.0, canvasPt.x - anchor.x)
+                    newH = max(10.0, anchor.y - canvasPt.y)
+                case .bottomLeft:
+                    newW = max(10.0, anchor.x - canvasPt.x)
+                    newH = max(10.0, anchor.y - canvasPt.y)
+                }
+
+                let scaleX = newW / initW
+                let scaleY = newH / initH
+
+                for i in 0..<document.activePage.strokes[selIdx].points.count {
+                    if i < initialStrokePoints.count {
+                        let initPt = initialStrokePoints[i]
+                        document.activePage.strokes[selIdx].points[i].x = anchor.x + (initPt.x - anchor.x) * scaleX
+                        document.activePage.strokes[selIdx].points[i].y = anchor.y + (initPt.y - anchor.y) * scaleY
+                    }
+                }
+                hasMovedSignificantly = true
+                needsDisplay = true
+                return
+
+            case .none:
+                break
+            }
+        }
+
         if activeTool == .eraser {
             eraseAt(canvasPt)
             return
@@ -385,7 +775,6 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
 
         let pt = StrokePoint(x: canvasPt.x, y: canvasPt.y, pressure: CGFloat(event.pressure))
         if stroke.tool.isShape {
-            // Live Shape preview (start point and current drag point)
             let start = stroke.points[0].cgPoint
             let end = canvasPt
             stroke.points = makeShapePoints(tool: stroke.tool, start: start, end: end)
@@ -402,43 +791,156 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             return
         }
 
+        if transformMode != .none {
+            transformMode = .none
+            if hasMovedSignificantly {
+                canvasDelegate?.canvasDidUpdateDocument(document)
+            }
+            hasMovedSignificantly = false
+            needsDisplay = true
+            return
+        }
+
         if let stroke = currentStroke {
-            document.activePage.strokes.append(stroke)
-            redoStack.removeAll()
-            currentStroke = nil
-            canvasDelegate?.canvasDidUpdateDocument(document)
+            if stroke.tool == .laser {
+                laserStrokes.append((stroke: stroke, fadeStartTime: Date().timeIntervalSince1970))
+                currentStroke = nil
+                startLaserFadeLoop()
+            } else {
+                document.activePage.strokes.append(stroke)
+                redoStack.removeAll()
+                currentStroke = nil
+                canvasDelegate?.canvasDidUpdateDocument(document)
+            }
             needsDisplay = true
         }
     }
 
-    private func handleSelectMouseDown(at canvasPt: CGPoint) {
+    private func handleSelectMouseDown(at canvasPt: CGPoint, clickCount: Int) {
+        // 1. If stroke is already selected, check delete button or resize handles first
+        if let selIdx = selectedStrokeIndex, selIdx < document.activePage.strokes.count {
+            let stroke = document.activePage.strokes[selIdx]
+            let selRect = stroke.bounds.insetBy(dx: -6.0, dy: -6.0)
+
+            // A. Check Delete Button
+            let delRect = deleteButtonRect(for: selRect)
+            if delRect.contains(canvasPt) {
+                document.activePage.strokes.remove(at: selIdx)
+                selectedStrokeIndex = nil
+                canvasDelegate?.canvasDidUpdateDocument(document)
+                needsDisplay = true
+                return
+            }
+
+            // B. Check 8 Resize Handles
+            let handleDiam: CGFloat = 9.0 / zoomScale
+            for handle in ResizeHandle.allCases {
+                let hr = handleRect(for: handle, in: selRect, diameter: handleDiam)
+                if hr.contains(canvasPt) {
+                    let anchor: CGPoint
+                    switch handle {
+                    case .topLeft: anchor = CGPoint(x: selRect.maxX, y: selRect.minY)
+                    case .top: anchor = CGPoint(x: selRect.midX, y: selRect.minY)
+                    case .topRight: anchor = CGPoint(x: selRect.minX, y: selRect.minY)
+                    case .right: anchor = CGPoint(x: selRect.minX, y: selRect.midY)
+                    case .bottomRight: anchor = CGPoint(x: selRect.minX, y: selRect.maxY)
+                    case .bottom: anchor = CGPoint(x: selRect.midX, y: selRect.maxY)
+                    case .bottomLeft: anchor = CGPoint(x: selRect.maxX, y: selRect.maxY)
+                    case .left: anchor = CGPoint(x: selRect.maxX, y: selRect.midY)
+                    }
+
+                    transformMode = .resizing(handle: handle, anchor: anchor, initialBounds: stroke.bounds)
+                    initialStrokePoints = stroke.points
+                    dragStartPos = canvasPt
+                    hasMovedSignificantly = false
+                    return
+                }
+            }
+
+            // C. Check interior moving
+            if selRect.contains(canvasPt) {
+                if clickCount == 2 && (stroke.tool == .text || stroke.tool == .note) {
+                    startTextEditor(for: stroke, at: selIdx)
+                    return
+                }
+                transformMode = .moving
+                initialStrokePoints = stroke.points
+                dragStartPos = canvasPt
+                hasMovedSignificantly = false
+                return
+            }
+        }
+
+        // 2. Click on any stroke to select it
         for (idx, stroke) in document.activePage.strokes.enumerated().reversed() {
-            if stroke.hitTest(canvasPt, tolerance: 10.0) {
+            if stroke.hitTest(canvasPt, tolerance: 12.0) {
                 selectedStrokeIndex = idx
+                if clickCount == 2 && (stroke.tool == .text || stroke.tool == .note) {
+                    startTextEditor(for: stroke, at: idx)
+                    return
+                }
+                transformMode = .moving
+                initialStrokePoints = stroke.points
+                dragStartPos = canvasPt
+                hasMovedSignificantly = false
                 needsDisplay = true
                 return
             }
         }
+
+        // 3. Clicked empty space
         clearSelection()
     }
 
     public func clearSelection() {
         selectedStrokeIndex = nil
+        transformMode = .none
         needsDisplay = true
     }
 
     private func eraseAt(_ pt: CGPoint) {
         var didErase = false
-        document.activePage.strokes.removeAll { stroke in
-            if stroke.hitTest(pt, tolerance: 16.0) {
-                didErase = true
-                return true
+        if eraserType == .object {
+            document.activePage.strokes.removeAll { stroke in
+                if stroke.hitTest(pt, tolerance: 16.0) {
+                    didErase = true
+                    return true
+                }
+                return false
             }
-            return false
+        } else {
+            // Stroke / Pixel Eraser
+            for i in 0..<document.activePage.strokes.count {
+                let stroke = document.activePage.strokes[i]
+                if stroke.hitTest(pt, tolerance: 12.0) {
+                    let filtered = stroke.points.filter { hypot($0.x - pt.x, $0.y - pt.y) > 14.0 }
+                    if filtered.count != stroke.points.count {
+                        document.activePage.strokes[i].points = filtered
+                        didErase = true
+                    }
+                }
+            }
+            document.activePage.strokes.removeAll { $0.points.isEmpty }
         }
+
         if didErase {
             canvasDelegate?.canvasDidUpdateDocument(document)
             needsDisplay = true
+        }
+    }
+
+    // MARK: - Laser Fade Animation Loop
+    private func startLaserFadeLoop() {
+        guard laserDisplayTimer == nil else { return }
+        laserDisplayTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            let now = Date().timeIntervalSince1970
+            self.laserStrokes.removeAll { now - $0.fadeStartTime >= 2.2 }
+            self.needsDisplay = true
+            if self.laserStrokes.isEmpty {
+                timer.invalidate()
+                self.laserDisplayTimer = nil
+            }
         }
     }
 
@@ -535,7 +1037,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         field.stringValue = initialText
         field.isBordered = !isNote
         field.font = .systemFont(ofSize: 18)
-        field.backgroundColor = isNote ? NSColor(hex: "#FFF382") : .white
+        field.backgroundColor = isNote ? (NSColor(hex: "#FFF382") ?? .yellow) : .white
         field.delegate = self
         addSubview(field)
         field.becomeFirstResponder()
@@ -556,13 +1058,22 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         }
     }
 
+    private func startTextEditor(for stroke: Stroke, at index: Int) {
+        commitActiveTextEditor()
+        editingStrokeIndex = index
+        let p = stroke.points[0].cgPoint
+        startTextEditor(at: p, initialText: stroke.text ?? "", isNote: stroke.tool == .note)
+    }
+
     public func commitActiveTextEditor() {
         guard let field = activeTextField, let idx = editingStrokeIndex else { return }
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty {
             document.activePage.strokes.remove(at: idx)
+            selectedStrokeIndex = nil
         } else {
             document.activePage.strokes[idx].text = text
+            selectedStrokeIndex = idx
         }
         field.removeFromSuperview()
         activeTextField = nil
@@ -574,7 +1085,6 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     // MARK: - Trackpad & Scroll Gestures
     public override func scrollWheel(with event: NSEvent) {
         if event.modifierFlags.contains(.command) {
-            // Zoom via pinch / cmd-scroll
             let zoomDelta = event.deltaY * 0.015
             let newScale = zoomScale + zoomDelta
             let mousePt = convert(event.locationInWindow, from: nil)
@@ -582,7 +1092,6 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             return
         }
 
-        // Two-finger pan
         panOffset = CGPoint(x: panOffset.x + event.scrollingDeltaX, y: panOffset.y - event.scrollingDeltaY)
     }
 
@@ -616,12 +1125,35 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         zoomTo(scale: 1.0, centeredAt: CGPoint(x: bounds.midX, y: bounds.midY))
     }
 
+    public func zoomToFit() {
+        guard !document.activePage.strokes.isEmpty else {
+            resetZoom()
+            return
+        }
+        var unionBounds = document.activePage.strokes[0].bounds
+        for s in document.activePage.strokes.dropFirst() {
+            unionBounds = unionBounds.union(s.bounds)
+        }
+        let pad: CGFloat = 80.0
+        let targetW = max(100.0, unionBounds.width + pad * 2)
+        let targetH = max(100.0, unionBounds.height + pad * 2)
+        let scaleX = bounds.width / targetW
+        let scaleY = bounds.height / targetH
+        let newScale = max(0.25, min(2.0, min(scaleX, scaleY)))
+        zoomScale = newScale
+        panOffset = CGPoint(
+            x: bounds.midX - unionBounds.midX * newScale,
+            y: bounds.midY - unionBounds.midY * newScale
+        )
+    }
+
     // MARK: - Undo / Redo / Clear
     public func undo() {
         commitActiveTextEditor()
         guard !document.activePage.strokes.isEmpty else { return }
         let stroke = document.activePage.strokes.removeLast()
         redoStack.append(stroke)
+        selectedStrokeIndex = nil
         canvasDelegate?.canvasDidUpdateDocument(document)
         needsDisplay = true
     }
@@ -631,6 +1163,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         guard !redoStack.isEmpty else { return }
         let stroke = redoStack.removeLast()
         document.activePage.strokes.append(stroke)
+        selectedStrokeIndex = nil
         canvasDelegate?.canvasDidUpdateDocument(document)
         needsDisplay = true
     }
@@ -669,7 +1202,6 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     public override var acceptsFirstResponder: Bool { true }
 
     public override func keyDown(with event: NSEvent) {
-        // If editing text, let the text field handle it
         if activeTextField != nil {
             super.keyDown(with: event)
             return
@@ -702,9 +1234,8 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
 
         switch chars {
         case "v": activeTool = .select
-        case "h": activeTool = .hand
+        case "h", "m": activeTool = .hand
         case "p": activeTool = .pen
-        case "m": activeTool = .highlighter
         case "d": activeTool = .laser
         case "e": activeTool = .eraser
         case "t": activeTool = .text
@@ -741,5 +1272,100 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         default: cursor = .crosshair
         }
         addCursorRect(bounds, cursor: cursor)
+    }
+
+    // MARK: - FreeformWhiteboardActionDelegate
+    public func freeformDidSelectTool(_ tool: Tool) {
+        self.activeTool = tool
+        self.freeformState.activeTool = tool
+        window?.invalidateCursorRects(for: self)
+    }
+
+    public func freeformDidChangeColor(_ color: NSColor) {
+        self.activeColor = color
+        self.freeformState.activeColor = Color(color)
+    }
+
+    public func freeformDidChangeWidth(_ width: CGFloat) {
+        self.activeWidth = width
+        self.freeformState.activeWidth = width
+    }
+
+    public func freeformDidRequestNewBoard() {
+        canvasDelegate?.canvasDidRequestNewBoard()
+    }
+
+    public func freeformDidRequestOpenBoard() {
+        canvasDelegate?.canvasDidRequestOpen()
+    }
+
+    public func freeformDidRequestSaveBoard() {
+        canvasDelegate?.canvasDidRequestSave()
+    }
+
+    public func freeformDidRequestSaveBoardAs() {
+        canvasDelegate?.canvasDidRequestSaveAs()
+    }
+
+    public func freeformDidRequestExportPDF() {
+        canvasDelegate?.canvasDidRequestExportPDF()
+    }
+
+    public func freeformDidRequestInsertPDF() {
+        canvasDelegate?.canvasDidRequestInsertPDF()
+    }
+
+    public func freeformDidRequestRename(to newTitle: String) {
+        document.title = newTitle
+        freeformState.documentTitle = newTitle
+        canvasDelegate?.canvasDidUpdateDocument(document)
+    }
+
+    public func freeformDidRequestUndo() {
+        undo()
+    }
+
+    public func freeformDidRequestRedo() {
+        redo()
+    }
+
+    public func freeformDidRequestClear() {
+        clearAll()
+    }
+
+    public func freeformDidChangeEraserType(_ type: EraserType) {
+        self.eraserType = type
+        self.freeformState.eraserType = type
+    }
+
+    public func freeformDidChangePattern(_ pattern: String) {
+        self.freeformState.pattern = pattern
+        self.document.activePage.pattern = pattern
+        needsDisplay = true
+    }
+
+    public func freeformDidChangeOpacity(_ opacity: CGFloat) {
+        self.freeformState.boardOpacity = opacity
+        needsDisplay = true
+    }
+
+    public func freeformDidZoomIn() {
+        zoomIn()
+    }
+
+    public func freeformDidZoomOut() {
+        zoomOut()
+    }
+
+    public func freeformDidResetZoom() {
+        resetZoom()
+    }
+
+    public func freeformDidSetZoom(_ scale: CGFloat) {
+        zoomTo(scale: scale, centeredAt: CGPoint(x: bounds.midX, y: bounds.midY))
+    }
+
+    public func freeformDidZoomToFit() {
+        zoomToFit()
     }
 }

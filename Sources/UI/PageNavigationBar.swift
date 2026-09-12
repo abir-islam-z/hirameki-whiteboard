@@ -31,10 +31,13 @@ public struct PageNavigationBar: View {
                     Text(document.activePage.name)
                         .font(.system(size: 12.5, weight: .semibold))
                         .foregroundColor(.primary)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
 
                     Text("(\(document.activePageIndex + 1)/\(document.pages.count))")
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
                         .foregroundColor(.secondary)
+                        .fixedSize(horizontal: true, vertical: false)
 
                     Image(systemName: "chevron.up.chevron.down")
                         .font(.system(size: 9, weight: .bold))
@@ -106,53 +109,24 @@ public struct PageNavigationBar: View {
                     )
             }
             .buttonStyle(.plain)
-
-            Spacer()
-
-            // MARK: - 4. Zoom Controls
-            HStack(spacing: 4) {
-                Button {
-                    onZoomOut()
-                } label: {
-                    Image(systemName: "minus")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 20, height: 20)
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    onResetZoom()
-                } label: {
-                    Text("\(Int(round(currentZoom * 100)))%")
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundColor(.primary)
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    onZoomIn()
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 20, height: 20)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(Color(NSColor.controlBackgroundColor).opacity(0.85))
-            .clipShape(Capsule())
-            .overlay(
-                Capsule().stroke(Color.primary.opacity(0.12), lineWidth: 1)
-            )
+            .help("Add New Page")
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .shadow(color: Color.black.opacity(0.1), radius: 6, x: 0, y: 2)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(.ultraThinMaterial)
+        .clipShape(Capsule())
+        .overlay(
+            Capsule()
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.4), Color.white.opacity(0.1)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: 0.75
+                )
         )
+        .shadow(color: Color.black.opacity(0.08), radius: 10, x: 0, y: 3)
     }
 
     // MARK: - Pages Popover (tldraw-style Page Management Drawer)

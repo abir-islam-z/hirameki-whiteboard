@@ -3,134 +3,306 @@ import SwiftUI
 import UniformTypeIdentifiers
 import PDFKit
 
-// MARK: - Whiteboard ViewModel
-public final class WhiteboardViewModel: ObservableObject, WhiteboardCanvasDelegate {
-    @Published public var document: WhiteboardDocument = WhiteboardDocument()
-    @Published public var activeTool: Tool = .pen
-    @Published public var activeColor: Color = .black
-    @Published public var activeWidth: CGFloat = 4.0
-    @Published public var currentZoom: CGFloat = 1.0
-
+// MARK: - Native Unified Toolbar Delegate
+public final class WhiteboardToolbarDelegate: NSObject, NSToolbarDelegate {
     public weak var canvasView: WhiteboardCanvasView?
-    public weak var window: NSWindow?
 
-    public init(document: WhiteboardDocument = WhiteboardDocument()) {
-        self.document = document
+    public init(canvasView: WhiteboardCanvasView?) {
+        self.canvasView = canvasView
+        super.init()
     }
 
-    public func syncFromCanvas() {
-        guard let canvas = canvasView else { return }
-        self.document = canvas.document
-        self.currentZoom = canvas.zoomScale
-        self.activeTool = canvas.activeTool
+    public static let titleItemId = NSToolbarItem.Identifier("HiramekiWBTitleItem")
+    public static let toolsCapsuleId = NSToolbarItem.Identifier("HiramekiWBToolsCapsule")
+    public static let patternItemId = NSToolbarItem.Identifier("HiramekiWBPatternItem")
+
+    public func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [
+            Self.titleItemId,
+            .flexibleSpace,
+            Self.toolsCapsuleId,
+            .flexibleSpace,
+            Self.patternItemId
+        ]
+    }
+
+    public func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [
+            Self.titleItemId,
+            .flexibleSpace,
+            Self.toolsCapsuleId,
+            .flexibleSpace,
+            Self.patternItemId
+        ]
+    }
+
+    public func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        guard let canvas = canvasView else { return nil }
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+
+        switch itemIdentifier {
+        case Self.titleItemId:
+            let titleView = FreeformWhiteboardTitleView(state: canvas.freeformState, delegate: canvas)
+            let host = NSHostingView(rootView: titleView)
+            item.view = host
+            return item
+
+        case Self.toolsCapsuleId:
+            let toolsView = FreeformWhiteboardToolsCapsule(state: canvas.freeformState, delegate: canvas)
+            let host = NSHostingView(rootView: toolsView)
+            item.view = host
+            return item
+
+        case Self.patternItemId:
+            let patternView = FreeformWhiteboardPatternView(state: canvas.freeformState, delegate: canvas)
+            let host = NSHostingView(rootView: patternView)
+            item.view = host
+            return item
+
+        default:
+            return nil
+        }
+    }
+}
+
+// MARK: - Native macOS Tahoe 26 Whiteboard Window
+public final class WhiteboardWindow: NSWindow {
+    public let canvasView: WhiteboardCanvasView
+    private var toolbarDelegate: WhiteboardToolbarDelegate?
+
+    public init(canvasView: WhiteboardCanvasView, initialRect: NSRect) {
+        self.canvasView = canvasView
+
+        super.init(
+            contentRect: initialRect,
+            styleMask: [
+                .titled,
+                .closable,
+                .miniaturizable,
+                .resizable,
+                .fullSizeContentView
+            ],
+            backing: .buffered,
+            defer: false
+        )
+
+        title = "Hirameki Whiteboard"
+        titleVisibility = .hidden
+        titlebarAppearsTransparent = true
+        toolbarStyle = .unified
+        collectionBehavior = [.fullScreenPrimary]
+        appearance = NSAppearance(named: .aqua)
+        backgroundColor = .white
+        hasShadow = true
+        minSize = NSSize(width: 820, height: 540)
+
+        // Attach native unified toolbar
+        let tbDelegate = WhiteboardToolbarDelegate(canvasView: canvasView)
+        self.toolbarDelegate = tbDelegate
+        let toolbar = NSToolbar(identifier: "HiramekiWhiteboardUnifiedToolbar")
+        toolbar.delegate = tbDelegate
+        toolbar.displayMode = .iconOnly
+        self.toolbar = toolbar
+
+        contentView = canvasView
+        setFrameAutosaveName("HiramekiFreeformWhiteboardWindow")
+    }
+
+    public override var canBecomeKey: Bool { true }
+    public override var canBecomeMain: Bool { true }
+
+    public override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command) {
+            guard let chars = event.charactersIgnoringModifiers?.lowercased() else {
+                return super.performKeyEquivalent(with: event)
+            }
+            if chars == "w" {
+                performClose(nil)
+                return true
+            }
+            if chars == "m" {
+                miniaturize(nil)
+                return true
+            }
+            if chars == "0" {
+                canvasView.resetZoom()
+                return true
+            }
+            if chars == "=" || chars == "+" {
+                canvasView.zoomIn()
+                return true
+            }
+            if chars == "-" {
+                canvasView.zoomOut()
+                return true
+            }
+            if chars == "s" {
+                if event.modifierFlags.contains(.shift) {
+                    canvasView.freeformDidRequestSaveBoardAs()
+                } else {
+                    canvasView.freeformDidRequestSaveBoard()
+                }
+                return true
+            }
+            if chars == "o" {
+                canvasView.freeformDidRequestOpenBoard()
+                return true
+            }
+            if chars == "n" {
+                canvasView.freeformDidRequestNewBoard()
+                return true
+            }
+            if chars == "e" {
+                canvasView.freeformDidRequestExportPDF()
+                return true
+            }
+            if chars == "i" {
+                canvasView.freeformDidRequestInsertPDF()
+                return true
+            }
+            if chars == "z" {
+                if event.modifierFlags.contains(.shift) {
+                    canvasView.redo()
+                } else {
+                    canvasView.undo()
+                }
+                return true
+            }
+            if chars == "k" {
+                canvasView.clearAll()
+                return true
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+// MARK: - Main Whiteboard Window Controller
+public final class WhiteboardWindowController: NSWindowController, NSWindowDelegate, WhiteboardCanvasDelegate {
+    public var canvasView: WhiteboardCanvasView!
+    public var whiteboardWindow: WhiteboardWindow!
+
+    public init(document: WhiteboardDocument = WhiteboardDocument()) {
+        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 100, y: 100, width: 1280, height: 820)
+        let width = min(1280, screenFrame.width - 80)
+        let height = min(820, screenFrame.height - 80)
+        let initialRect = NSRect(
+            x: screenFrame.midX - width / 2,
+            y: screenFrame.midY - height / 2,
+            width: width,
+            height: height
+        )
+
+        let canvas = WhiteboardCanvasView(frame: NSRect(origin: .zero, size: initialRect.size), document: document)
+        let win = WhiteboardWindow(canvasView: canvas, initialRect: initialRect)
+
+        super.init(window: win)
+
+        self.canvasView = canvas
+        self.whiteboardWindow = win
+        win.delegate = self
+        canvas.canvasDelegate = self
+
         updateWindowTitle()
     }
 
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
     public func updateWindowTitle() {
-        let pageName = document.activePage.name
-        let docTitle = document.title
-        window?.title = "\(docTitle) — \(pageName)"
+        guard let canvas = canvasView, let win = whiteboardWindow else { return }
+        let pageName = canvas.document.activePage.name
+        let docTitle = canvas.document.title
+        win.title = "\(docTitle) — \(pageName)"
     }
 
-    // MARK: - Page Actions
-    public func selectPage(at index: Int) {
-        canvasView?.switchToPage(at: index)
-        syncFromCanvas()
-    }
-
-    public func addPage() {
-        let newIndex = canvasView?.document.addPage() ?? document.addPage()
-        canvasView?.switchToPage(at: newIndex)
-        syncFromCanvas()
-    }
-
-    public func duplicatePage(at index: Int) {
-        let newIndex = canvasView?.document.duplicatePage(at: index) ?? document.duplicatePage(at: index)
-        canvasView?.switchToPage(at: newIndex)
-        syncFromCanvas()
-    }
-
-    public func deletePage(at index: Int) {
-        canvasView?.document.deletePage(at: index)
-        canvasView?.loadCurrentPage()
-        syncFromCanvas()
-    }
-
-    public func renamePage(at index: Int, to newName: String) {
-        canvasView?.document.renamePage(at: index, to: newName)
-        syncFromCanvas()
-    }
-
-    public func nextPage() {
-        if document.activePageIndex < document.pages.count - 1 {
-            selectPage(at: document.activePageIndex + 1)
+    public func windowWillClose(_ notification: Notification) {
+        if let fileURL = canvasView.document.fileURL {
+            try? canvasView.document.save(to: fileURL)
         }
     }
 
-    public func prevPage() {
-        if document.activePageIndex > 0 {
-            selectPage(at: document.activePageIndex - 1)
+    // MARK: - File Dialogs
+    public func saveBoardDialog(saveAs: Bool = false) {
+        guard let win = whiteboardWindow else { return }
+
+        if !saveAs, let existingURL = canvasView.document.fileURL {
+            do {
+                try canvasView.document.save(to: existingURL)
+            } catch {
+                let alert = NSAlert(error: error)
+                alert.runModal()
+            }
+            return
         }
-    }
 
-    // MARK: - Canvas Actions
-    public func undo() {
-        canvasView?.undo()
-        syncFromCanvas()
-    }
+        let savePanel = NSSavePanel()
+        savePanel.directoryURL = WhiteboardDocument.defaultDirectory
+        savePanel.nameFieldStringValue = "\(canvasView.document.title).\(WhiteboardDocument.fileExtension)"
+        if let uti = UTType(filenameExtension: WhiteboardDocument.fileExtension) {
+            savePanel.allowedContentTypes = [uti]
+        }
+        savePanel.title = "Save Whiteboard File"
+        savePanel.message = "Choose a location to save this Hirameki Whiteboard"
 
-    public func redo() {
-        canvasView?.redo()
-        syncFromCanvas()
-    }
-
-    public func clearAll() {
-        canvasView?.clearAll()
-        syncFromCanvas()
-    }
-
-    public func zoomIn() {
-        canvasView?.zoomIn()
-        currentZoom = canvasView?.zoomScale ?? 1.0
-    }
-
-    public func zoomOut() {
-        canvasView?.zoomOut()
-        currentZoom = canvasView?.zoomScale ?? 1.0
-    }
-
-    public func resetZoom() {
-        canvasView?.resetZoom()
-        currentZoom = canvasView?.zoomScale ?? 1.0
-    }
-
-    // MARK: - PDF Insertion & Export
-    public func promptInsertPDF() {
-        let panel = NSOpenPanel()
-        panel.title = "Insert PDF into Whiteboard"
-        panel.allowedContentTypes = [.pdf]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.canCreateDirectories = false
-
-        panel.beginSheetModal(for: window ?? NSApp.keyWindow ?? NSWindow()) { [weak self] response in
-            if response == .OK, let url = panel.url {
-                self?.canvasView?.insertPDF(url: url)
-                self?.syncFromCanvas()
+        savePanel.beginSheetModal(for: win) { [weak self] response in
+            guard let self = self else { return }
+            if response == .OK, let url = savePanel.url {
+                do {
+                    try self.canvasView.document.save(to: url)
+                    self.updateWindowTitle()
+                } catch {
+                    let alert = NSAlert(error: error)
+                    alert.runModal()
+                }
             }
         }
     }
 
-    public func promptExportPDF() {
-        let panel = NSSavePanel()
-        panel.title = "Export Annotated PDF"
-        panel.allowedContentTypes = [.pdf]
-        let safeName = document.activePage.name.replacingOccurrences(of: "/", with: "-")
-        panel.nameFieldStringValue = "\(document.title) - \(safeName).pdf"
+    public func openBoardDialog() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = WhiteboardDocument.defaultDirectory
+        if let uti = UTType(filenameExtension: WhiteboardDocument.fileExtension) {
+            panel.allowedContentTypes = [uti]
+        }
+        panel.title = "Open Whiteboard File"
+        panel.message = "Choose a Hirameki Whiteboard file to open"
 
-        panel.beginSheetModal(for: window ?? NSApp.keyWindow ?? NSWindow()) { [weak self] response in
-            guard response == .OK, let url = panel.url, let self = self else { return }
-            let pdfData = PDFExportManager.shared.exportPageToPDF(page: self.document.activePage)
+        guard let win = whiteboardWindow else { return }
+        panel.beginSheetModal(for: win) { response in
+            if response == .OK, let url = panel.url {
+                do {
+                    let doc = try WhiteboardDocument.load(from: url)
+                    let newCtrl = WhiteboardAppDelegate.shared.createBoard(document: doc)
+                    newCtrl.showWindow(nil)
+                } catch {
+                    let alert = NSAlert(error: error)
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    public func exportPDFDialog() {
+        guard let win = whiteboardWindow else { return }
+        let savePanel = NSSavePanel()
+        savePanel.allowedContentTypes = [.pdf]
+        savePanel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        let safeName = canvasView.document.activePage.name.replacingOccurrences(of: "/", with: "-")
+        savePanel.nameFieldStringValue = "\(canvasView.document.title) - \(safeName).pdf"
+        savePanel.title = "Export Whiteboard to PDF"
+
+        savePanel.beginSheetModal(for: win) { [weak self] response in
+            guard let self = self, response == .OK, let url = savePanel.url else { return }
+            let pdfData = PDFExportManager.shared.exportPageToPDF(page: self.canvasView.document.activePage)
             do {
                 try pdfData.write(to: url, options: .atomic)
                 NSWorkspace.shared.activateFileViewerSelecting([url])
@@ -141,232 +313,54 @@ public final class WhiteboardViewModel: ObservableObject, WhiteboardCanvasDelega
         }
     }
 
-    // MARK: - Save & Load Whiteboard Document (.hiramekiboard)
-    public func promptSaveDocument(saveAs: Bool = false) {
-        if !saveAs, let existingURL = document.fileURL {
-            do {
-                try document.save(to: existingURL)
-            } catch {
-                let alert = NSAlert(error: error)
-                alert.runModal()
-            }
-            return
-        }
-
-        let panel = NSSavePanel()
-        panel.title = "Save Hirameki Whiteboard"
-        panel.allowedContentTypes = [UTType(filenameExtension: WhiteboardDocument.fileExtension) ?? .json]
-        panel.nameFieldStringValue = "\(document.title).\(WhiteboardDocument.fileExtension)"
-
-        panel.beginSheetModal(for: window ?? NSApp.keyWindow ?? NSWindow()) { [weak self] response in
-            guard response == .OK, let url = panel.url, let self = self else { return }
-            do {
-                self.document.title = url.deletingPathExtension().lastPathComponent
-                try self.document.save(to: url)
-                self.updateWindowTitle()
-            } catch {
-                let alert = NSAlert(error: error)
-                alert.runModal()
-            }
-        }
-    }
-
-    public func promptOpenDocument() {
+    public func promptInsertPDF() {
+        guard let win = whiteboardWindow else { return }
         let panel = NSOpenPanel()
-        panel.title = "Open Hirameki Whiteboard"
-        panel.allowedContentTypes = [UTType(filenameExtension: WhiteboardDocument.fileExtension) ?? .json, .pdf]
+        panel.title = "Insert PDF into Whiteboard"
+        panel.allowedContentTypes = [.pdf]
         panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseDirectories = false
 
-        panel.beginSheetModal(for: window ?? NSApp.keyWindow ?? NSWindow()) { [weak self] response in
-            guard response == .OK, let url = panel.url, let self = self else { return }
-            if url.pathExtension.lowercased() == "pdf" {
-                self.canvasView?.insertPDF(url: url)
-                self.syncFromCanvas()
-            } else {
-                do {
-                    let loadedDoc = try WhiteboardDocument.load(from: url)
-                    self.document = loadedDoc
-                    self.canvasView?.document = loadedDoc
-                    self.canvasView?.loadCurrentPage()
-                    self.syncFromCanvas()
-                } catch {
-                    let alert = NSAlert(error: error)
-                    alert.runModal()
-                }
+        panel.beginSheetModal(for: win) { [weak self] response in
+            if response == .OK, let url = panel.url {
+                self?.canvasView.insertPDF(url: url)
             }
         }
     }
 
     // MARK: - WhiteboardCanvasDelegate
     public func canvasDidUpdateDocument(_ doc: WhiteboardDocument) {
-        self.document = doc
         updateWindowTitle()
     }
 
     public func canvasDidRequestNewPage() {
-        addPage()
+        canvasView.addNewPage()
     }
 
     public func canvasDidRequestInsertPDF() {
         promptInsertPDF()
     }
-}
 
-// MARK: - Root SwiftUI Window View
-public struct WhiteboardRootView: View {
-    @ObservedObject var vm: WhiteboardViewModel
-
-    public var body: some View {
-        ZStack {
-            // Background is transparent so mouse passes through to canvas
-            Color.clear
-
-            // Top Floating Toolbar
-            VStack {
-                WhiteboardToolbar(
-                    activeTool: Binding(
-                        get: { vm.activeTool },
-                        set: { newTool in
-                            vm.activeTool = newTool
-                            vm.canvasView?.activeTool = newTool
-                        }
-                    ),
-                    activeColor: Binding(
-                        get: { vm.activeColor },
-                        set: { newColor in
-                            vm.activeColor = newColor
-                            vm.canvasView?.activeColor = NSColor(newColor)
-                        }
-                    ),
-                    activeWidth: Binding(
-                        get: { vm.activeWidth },
-                        set: { newWidth in
-                            vm.activeWidth = newWidth
-                            vm.canvasView?.activeWidth = newWidth
-                        }
-                    ),
-                    onInsertPDF: { vm.promptInsertPDF() },
-                    onUndo: { vm.undo() },
-                    onRedo: { vm.redo() },
-                    onClearAll: { vm.clearAll() },
-                    onExportPDF: { vm.promptExportPDF() }
-                )
-                .padding(.top, 14)
-
-                Spacer()
-            }
-
-            // Bottom Floating Page Navigation Bar
-            VStack {
-                Spacer()
-
-                HStack {
-                    PageNavigationBar(
-                        document: $vm.document,
-                        onSelectPage: { idx in vm.selectPage(at: idx) },
-                        onAddPage: { vm.addPage() },
-                        onDuplicatePage: { idx in vm.duplicatePage(at: idx) },
-                        onDeletePage: { idx in vm.deletePage(at: idx) },
-                        onRenamePage: { idx, name in vm.renamePage(at: idx, to: name) },
-                        onZoomIn: { vm.zoomIn() },
-                        onZoomOut: { vm.zoomOut() },
-                        onResetZoom: { vm.resetZoom() },
-                        currentZoom: vm.currentZoom
-                    )
-                    .frame(maxWidth: 480)
-
-                    Spacer()
-                }
-                .padding(.leading, 18)
-                .padding(.bottom, 16)
-            }
-        }
-    }
-}
-
-// MARK: - Pass-Through Hosting View for Transparent SwiftUI Overlay
-public final class TransparentPassThroughHostingView<Content: View>: NSHostingView<Content> {
-    public override func hitTest(_ point: NSPoint) -> NSView? {
-        let view = super.hitTest(point)
-        // If the hit view is the hosting view itself or background, let the canvas underneath receive mouse events
-        if view === self {
-            return nil
-        }
-        return view
-    }
-}
-
-// MARK: - Main Whiteboard Window Controller
-public final class WhiteboardWindowController: NSWindowController, NSWindowDelegate {
-    public let viewModel: WhiteboardViewModel
-    private var canvasView: WhiteboardCanvasView!
-    private var overlayHostingView: TransparentPassThroughHostingView<WhiteboardRootView>!
-
-    public init(document: WhiteboardDocument = WhiteboardDocument()) {
-        self.viewModel = WhiteboardViewModel(document: document)
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 100, y: 100, width: 1280, height: 800),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.minSize = NSSize(width: 880, height: 560)
-        window.title = "Hirameki Whiteboard"
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.backgroundColor = .white
-        window.isOpaque = true
-        window.isReleasedWhenClosed = false
-        super.init(window: window)
-        window.delegate = self
-        self.viewModel.window = window
-
-        setupViews(in: window)
+    public func canvasDidRequestSave() {
+        saveBoardDialog(saveAs: false)
     }
 
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+    public func canvasDidRequestSaveAs() {
+        saveBoardDialog(saveAs: true)
     }
 
-    private func setupViews(in window: NSWindow) {
-        guard let contentView = window.contentView else { return }
-
-        // 1. Vector Infinite Canvas (Main background responder)
-        canvasView = WhiteboardCanvasView(frame: contentView.bounds, document: viewModel.document)
-        canvasView.autoresizingMask = [.width, .height]
-        canvasView.canvasDelegate = viewModel
-        viewModel.canvasView = canvasView
-
-        canvasView.onToolChanged = { [weak self] newTool in
-            DispatchQueue.main.async {
-                self?.viewModel.activeTool = newTool
-            }
-        }
-        canvasView.onZoomChanged = { [weak self] newZoom in
-            DispatchQueue.main.async {
-                self?.viewModel.currentZoom = newZoom
-            }
-        }
-
-        contentView.addSubview(canvasView)
-
-        // 2. SwiftUI Floating Overlays (Toolbar & Page Navigator)
-        let rootView = WhiteboardRootView(vm: viewModel)
-        overlayHostingView = TransparentPassThroughHostingView(rootView: rootView)
-        overlayHostingView.frame = contentView.bounds
-        overlayHostingView.autoresizingMask = [.width, .height]
-
-        contentView.addSubview(overlayHostingView)
-
-        viewModel.updateWindowTitle()
-        window.makeFirstResponder(canvasView)
+    public func canvasDidRequestOpen() {
+        openBoardDialog()
     }
 
-    public func windowWillClose(_ notification: Notification) {
-        if let fileURL = viewModel.document.fileURL {
-            try? viewModel.document.save(to: fileURL)
-        }
+    public func canvasDidRequestExportPDF() {
+        exportPDFDialog()
+    }
+
+    public func canvasDidRequestNewBoard() {
+        let newCtrl = WhiteboardAppDelegate.shared.createBoard()
+        newCtrl.showWindow(nil)
     }
 }
 
@@ -389,13 +383,13 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         setupMainMenu()
-        createNewBoard()
+        createBoard()
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
     public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            createNewBoard()
+            createBoard()
         }
         return true
     }
@@ -403,16 +397,14 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
     public func application(_ sender: NSApplication, openFile filename: String) -> Bool {
         let url = URL(fileURLWithPath: filename)
         if url.pathExtension.lowercased() == "pdf" {
-            let winCtrl = createNewBoard()
-            winCtrl.viewModel.canvasView?.insertPDF(url: url)
-            winCtrl.viewModel.syncFromCanvas()
+            let winCtrl = createBoard()
+            winCtrl.canvasView.insertPDF(url: url)
             return true
         }
 
         do {
             let doc = try WhiteboardDocument.load(from: url)
-            let winCtrl = WhiteboardWindowController(document: doc)
-            windowControllers.append(winCtrl)
+            let winCtrl = createBoard(document: doc)
             winCtrl.showWindow(self)
             return true
         } catch {
@@ -423,13 +415,13 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @discardableResult
-    public func createNewBoard() -> WhiteboardWindowController {
-        let winCtrl = WhiteboardWindowController()
+    public func createBoard(document: WhiteboardDocument = WhiteboardDocument()) -> WhiteboardWindowController {
+        let winCtrl = WhiteboardWindowController(document: document)
         windowControllers.append(winCtrl)
         winCtrl.showWindow(self)
-        winCtrl.window?.center()
-        winCtrl.window?.makeKeyAndOrderFront(nil)
-        winCtrl.window?.orderFrontRegardless()
+        winCtrl.whiteboardWindow.center()
+        winCtrl.whiteboardWindow.makeKeyAndOrderFront(nil)
+        winCtrl.whiteboardWindow.orderFrontRegardless()
         return winCtrl
     }
 
@@ -448,12 +440,13 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
         let appMenuItem = NSMenuItem()
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "About Hirameki Whiteboard", action: #selector(showAbout), keyEquivalent: "")
-        appMenu.addItem(.separator())
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Hide Hirameki Whiteboard", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        let hideOthers = appMenu.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        let hideOthers = NSMenuItem(title: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
         hideOthers.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(hideOthers)
         appMenu.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
-        appMenu.addItem(.separator())
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Quit Hirameki Whiteboard", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
@@ -461,16 +454,18 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
         // 2. File Menu
         let fileMenuItem = NSMenuItem()
         let fileMenu = NSMenu(title: "File")
-        fileMenu.addItem(withTitle: "New Board", action: #selector(menuNewBoard), keyEquivalent: "n")
-        fileMenu.addItem(withTitle: "Open Board...", action: #selector(menuOpenBoard), keyEquivalent: "o")
-        fileMenu.addItem(.separator())
-        fileMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-        fileMenu.addItem(withTitle: "Save Board", action: #selector(menuSaveBoard), keyEquivalent: "s")
-        let saveAs = fileMenu.addItem(withTitle: "Save Board As...", action: #selector(menuSaveBoardAs), keyEquivalent: "s")
+        fileMenu.addItem(withTitle: "New Whiteboard", action: #selector(menuNewBoard), keyEquivalent: "n")
+        fileMenu.addItem(withTitle: "Open Whiteboard...", action: #selector(menuOpenBoard), keyEquivalent: "o")
+        fileMenu.addItem(NSMenuItem.separator())
+        fileMenu.addItem(withTitle: "Save", action: #selector(menuSaveBoard), keyEquivalent: "s")
+        let saveAs = NSMenuItem(title: "Save As...", action: #selector(menuSaveBoardAs), keyEquivalent: "S")
         saveAs.keyEquivalentModifierMask = [.command, .shift]
-        fileMenu.addItem(.separator())
-        fileMenu.addItem(withTitle: "Insert PDF...", action: #selector(menuInsertPDF), keyEquivalent: "i")
-        fileMenu.addItem(withTitle: "Export PDF...", action: #selector(menuExportPDF), keyEquivalent: "e")
+        fileMenu.addItem(saveAs)
+        fileMenu.addItem(NSMenuItem.separator())
+        fileMenu.addItem(withTitle: "Insert PDF Document...", action: #selector(menuInsertPDF), keyEquivalent: "i")
+        fileMenu.addItem(withTitle: "Export Annotated PDF...", action: #selector(menuExportPDF), keyEquivalent: "e")
+        fileMenu.addItem(NSMenuItem.separator())
+        fileMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         fileMenuItem.submenu = fileMenu
         mainMenu.addItem(fileMenuItem)
 
@@ -478,137 +473,90 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
         let editMenuItem = NSMenuItem()
         let editMenu = NSMenu(title: "Edit")
         editMenu.addItem(withTitle: "Undo", action: #selector(menuUndo), keyEquivalent: "z")
-        let redoItem = editMenu.addItem(withTitle: "Redo", action: #selector(menuRedo), keyEquivalent: "z")
+        let redoItem = NSMenuItem(title: "Redo", action: #selector(menuRedo), keyEquivalent: "Z")
         redoItem.keyEquivalentModifierMask = [.command, .shift]
-        editMenu.addItem(.separator())
-        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        editMenu.addItem(.separator())
-        editMenu.addItem(withTitle: "Clear Board", action: #selector(menuClearAll), keyEquivalent: "k")
+        editMenu.addItem(redoItem)
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(withTitle: "Clear Whiteboard", action: #selector(menuClearAll), keyEquivalent: "k")
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
 
-        // 4. Page Menu
-        let pageMenuItem = NSMenuItem()
-        let pageMenu = NSMenu(title: "Page")
-        let newPage = pageMenu.addItem(withTitle: "New Page", action: #selector(menuNewPage), keyEquivalent: "n")
-        newPage.keyEquivalentModifierMask = [.command, .option]
-        let dupPage = pageMenu.addItem(withTitle: "Duplicate Page", action: #selector(menuDuplicatePage), keyEquivalent: "d")
-        dupPage.keyEquivalentModifierMask = [.command, .option]
-        pageMenu.addItem(.separator())
-        let nextPage = pageMenu.addItem(withTitle: "Next Page", action: #selector(menuNextPage), keyEquivalent: String(UnicodeScalar(NSRightArrowFunctionKey)!))
-        nextPage.keyEquivalentModifierMask = [.command, .option]
-        let prevPage = pageMenu.addItem(withTitle: "Previous Page", action: #selector(menuPrevPage), keyEquivalent: String(UnicodeScalar(NSLeftArrowFunctionKey)!))
-        prevPage.keyEquivalentModifierMask = [.command, .option]
-        pageMenu.addItem(.separator())
-        let delPage = pageMenu.addItem(withTitle: "Delete Page", action: #selector(menuDeletePage), keyEquivalent: "\u{08}")
-        delPage.keyEquivalentModifierMask = [.command, .option]
-        pageMenuItem.submenu = pageMenu
-        mainMenu.addItem(pageMenuItem)
-
-        // 5. View Menu
+        // 4. View Menu
         let viewMenuItem = NSMenuItem()
         let viewMenu = NSMenu(title: "View")
-        viewMenu.addItem(withTitle: "Actual Size", action: #selector(menuResetZoom), keyEquivalent: "0")
-        viewMenu.addItem(withTitle: "Zoom In", action: #selector(menuZoomIn), keyEquivalent: "=")
+        viewMenu.addItem(withTitle: "Zoom In", action: #selector(menuZoomIn), keyEquivalent: "+")
         viewMenu.addItem(withTitle: "Zoom Out", action: #selector(menuZoomOut), keyEquivalent: "-")
-        viewMenu.addItem(.separator())
-        let fullScreen = viewMenu.addItem(withTitle: "Toggle Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
-        fullScreen.keyEquivalentModifierMask = [.command, .control]
+        viewMenu.addItem(withTitle: "Actual Size (100%)", action: #selector(menuResetZoom), keyEquivalent: "0")
+        viewMenu.addItem(NSMenuItem.separator())
+        let fullScreenItem = NSMenuItem(title: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
+        fullScreenItem.keyEquivalentModifierMask = [.command, .control]
+        viewMenu.addItem(fullScreenItem)
         viewMenuItem.submenu = viewMenu
         mainMenu.addItem(viewMenuItem)
 
-        // 6. Window Menu
-        let windowMenuItem = NSMenuItem()
-        let windowMenu = NSMenu(title: "Window")
-        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
-        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
-        windowMenu.addItem(.separator())
-        windowMenu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
-        windowMenuItem.submenu = windowMenu
-        mainMenu.addItem(windowMenuItem)
+        // 5. Window Menu
+        let winMenuItem = NSMenuItem()
+        let winMenu = NSMenu(title: "Window")
+        winMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        winMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        winMenuItem.submenu = winMenu
+        mainMenu.addItem(winMenuItem)
 
-        NSApp.mainMenu = mainMenu
+        NSApplication.shared.mainMenu = mainMenu
     }
 
-    // MARK: - Menu Actions
     @objc private func showAbout() {
         let alert = NSAlert()
         alert.messageText = "Hirameki Whiteboard"
-        alert.informativeText = "A standalone, local, multi-page vector whiteboard with native PDF annotation.\n\nVersion 1.0.0"
-        alert.alertStyle = .informational
+        alert.informativeText = "Infinite Vector Canvas with Multi-Page & PDF Annotation Support.\nVersion 1.0.0"
         alert.runModal()
     }
 
     @objc private func menuNewBoard() {
-        createNewBoard()
+        createBoard()
     }
 
     @objc private func menuOpenBoard() {
-        currentWindowController?.viewModel.promptOpenDocument()
+        currentWindowController?.openBoardDialog()
     }
 
     @objc private func menuSaveBoard() {
-        currentWindowController?.viewModel.promptSaveDocument(saveAs: false)
+        currentWindowController?.saveBoardDialog(saveAs: false)
     }
 
     @objc private func menuSaveBoardAs() {
-        currentWindowController?.viewModel.promptSaveDocument(saveAs: true)
+        currentWindowController?.saveBoardDialog(saveAs: true)
     }
 
     @objc private func menuInsertPDF() {
-        currentWindowController?.viewModel.promptInsertPDF()
+        currentWindowController?.promptInsertPDF()
     }
 
     @objc private func menuExportPDF() {
-        currentWindowController?.viewModel.promptExportPDF()
+        currentWindowController?.exportPDFDialog()
     }
 
     @objc private func menuUndo() {
-        currentWindowController?.viewModel.undo()
+        currentWindowController?.canvasView.undo()
     }
 
     @objc private func menuRedo() {
-        currentWindowController?.viewModel.redo()
+        currentWindowController?.canvasView.redo()
     }
 
     @objc private func menuClearAll() {
-        currentWindowController?.viewModel.clearAll()
-    }
-
-    @objc private func menuNewPage() {
-        currentWindowController?.viewModel.addPage()
-    }
-
-    @objc private func menuDuplicatePage() {
-        guard let vm = currentWindowController?.viewModel else { return }
-        vm.duplicatePage(at: vm.document.activePageIndex)
-    }
-
-    @objc private func menuDeletePage() {
-        guard let vm = currentWindowController?.viewModel else { return }
-        vm.deletePage(at: vm.document.activePageIndex)
-    }
-
-    @objc private func menuNextPage() {
-        currentWindowController?.viewModel.nextPage()
-    }
-
-    @objc private func menuPrevPage() {
-        currentWindowController?.viewModel.prevPage()
+        currentWindowController?.canvasView.clearAll()
     }
 
     @objc private func menuZoomIn() {
-        currentWindowController?.viewModel.zoomIn()
+        currentWindowController?.canvasView.zoomIn()
     }
 
     @objc private func menuZoomOut() {
-        currentWindowController?.viewModel.zoomOut()
+        currentWindowController?.canvasView.zoomOut()
     }
 
     @objc private func menuResetZoom() {
-        currentWindowController?.viewModel.resetZoom()
+        currentWindowController?.canvasView.resetZoom()
     }
 }
