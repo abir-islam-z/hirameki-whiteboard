@@ -383,7 +383,19 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         setupMainMenu()
-        createBoard()
+        let args = CommandLine.arguments.dropFirst()
+        var openedAny = false
+        for arg in args where !arg.starts(with: "-") {
+            let url = URL(fileURLWithPath: arg)
+            if FileManager.default.fileExists(atPath: url.path) {
+                if application(NSApplication.shared, openFile: url.path) {
+                    openedAny = true
+                }
+            }
+        }
+        if !openedAny && windowControllers.isEmpty {
+            createBoard()
+        }
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
@@ -394,11 +406,23 @@ public final class WhiteboardAppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    public func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            _ = self.application(application, openFile: url.path)
+        }
+    }
+
     public func application(_ sender: NSApplication, openFile filename: String) -> Bool {
         let url = URL(fileURLWithPath: filename)
         if url.pathExtension.lowercased() == "pdf" {
-            let winCtrl = createBoard()
+            let winCtrl: WhiteboardWindowController
+            if let first = windowControllers.first, first.canvasView.document.activePage.strokes.isEmpty && first.canvasView.document.activePage.embeddedPDFs.isEmpty {
+                winCtrl = first
+            } else {
+                winCtrl = createBoard()
+            }
             winCtrl.canvasView.insertPDF(url: url)
+            winCtrl.whiteboardWindow.makeKeyAndOrderFront(nil)
             return true
         }
 

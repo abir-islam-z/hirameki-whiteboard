@@ -4,30 +4,29 @@ import PDFKit
 public protocol PDFCanvasItemDelegate: AnyObject {
     func pdfItemDidUpdateFrame(_ item: EmbeddedPDF)
     func pdfItemDidRequestDelete(_ item: EmbeddedPDF)
+    func pdfItemCurrentZoomScale() -> CGFloat
 }
 
 public final class PDFCanvasItemView: NSView {
     public var embeddedPDF: EmbeddedPDF
     public weak var delegate: PDFCanvasItemDelegate?
 
-    public private(set) var pdfView: PDFView!
-    private var headerBar: NSView!
+    private var iconView: NSImageView!
     private var titleLabel: NSTextField!
     private var pageLabel: NSTextField!
     private var prevPageButton: NSButton!
     private var nextPageButton: NSButton!
     private var deleteButton: NSButton!
 
-    private var isSelected: Bool = false
     private var isDragging: Bool = false
     private var dragStartMouse: CGPoint = .zero
     private var dragStartOrigin: CGPoint = .zero
 
     public init(embeddedPDF: EmbeddedPDF) {
         self.embeddedPDF = embeddedPDF
-        super.init(frame: embeddedPDF.frame)
+        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 34))
         setupViews()
-        loadPDF()
+        updatePaginationUI()
     }
 
     required init?(coder: NSCoder) {
@@ -36,115 +35,97 @@ public final class PDFCanvasItemView: NSView {
 
     private func setupViews() {
         wantsLayer = true
-        layer?.cornerRadius = 10
+        layer?.cornerRadius = 17
         layer?.masksToBounds = false
+        layer?.backgroundColor = NSColor(calibratedRed: 0.14, green: 0.15, blue: 0.18, alpha: 0.90).cgColor
+        layer?.borderColor = NSColor(white: 1.0, alpha: 0.22).cgColor
+        layer?.borderWidth = 1.0
         layer?.shadowColor = NSColor.black.cgColor
-        layer?.shadowOpacity = 0.18
+        layer?.shadowOpacity = 0.28
         layer?.shadowRadius = 8
         layer?.shadowOffset = CGSize(width: 0, height: -3)
-        layer?.borderColor = NSColor(white: 0.8, alpha: 1.0).cgColor
-        layer?.borderWidth = 1.0
 
-        // 1. Header Bar (for moving, pagination & actions)
-        headerBar = NSView(frame: NSRect(x: 0, y: bounds.height - 36, width: bounds.width, height: 36))
-        headerBar.wantsLayer = true
-        headerBar.layer?.backgroundColor = NSColor(calibratedRed: 0.96, green: 0.96, blue: 0.98, alpha: 1.0).cgColor
-        headerBar.autoresizingMask = [.width, .minYMargin]
-        addSubview(headerBar)
+        // 1. PDF File Icon
+        iconView = NSImageView(frame: NSRect(x: 10, y: 8, width: 18, height: 18))
+        iconView.image = NSImage(systemSymbolName: "doc.text.fill", accessibilityDescription: "PDF")
+        iconView.contentTintColor = NSColor(calibratedRed: 1.0, green: 0.35, blue: 0.35, alpha: 1.0)
+        addSubview(iconView)
 
-        // Title
+        // 2. Title Label
         titleLabel = NSTextField(labelWithString: embeddedPDF.title)
-        titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
-        titleLabel.textColor = .labelColor
-        titleLabel.frame = NSRect(x: 10, y: 8, width: 220, height: 20)
-        titleLabel.cell?.lineBreakMode = .byTruncatingTail
-        headerBar.addSubview(titleLabel)
+        titleLabel.font = .systemFont(ofSize: 11.5, weight: .semibold)
+        titleLabel.textColor = .white
+        titleLabel.frame = NSRect(x: 32, y: 7, width: 130, height: 20)
+        titleLabel.cell?.lineBreakMode = .byTruncatingMiddle
+        addSubview(titleLabel)
 
-        // Page Label
-        pageLabel = NSTextField(labelWithString: "1 / 1")
-        pageLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        pageLabel.textColor = .secondaryLabelColor
-        pageLabel.alignment = .center
-        pageLabel.frame = NSRect(x: bounds.width - 160, y: 8, width: 60, height: 20)
-        pageLabel.autoresizingMask = [.minXMargin]
-        headerBar.addSubview(pageLabel)
-
-        // Previous Page Button
+        // 3. Page Controls Capsule
         prevPageButton = NSButton(title: "‹", target: self, action: #selector(goToPrevPage))
         prevPageButton.bezelStyle = .texturedRounded
-        prevPageButton.font = .systemFont(ofSize: 14, weight: .bold)
-        prevPageButton.frame = NSRect(x: bounds.width - 96, y: 6, width: 24, height: 24)
-        prevPageButton.autoresizingMask = [.minXMargin]
-        headerBar.addSubview(prevPageButton)
+        prevPageButton.isBordered = false
+        prevPageButton.font = .systemFont(ofSize: 15, weight: .bold)
+        prevPageButton.contentTintColor = .white
+        prevPageButton.frame = NSRect(x: 168, y: 5, width: 20, height: 24)
+        addSubview(prevPageButton)
 
-        // Next Page Button
+        pageLabel = NSTextField(labelWithString: "1 / 1")
+        pageLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        pageLabel.textColor = NSColor(white: 0.85, alpha: 1.0)
+        pageLabel.alignment = .center
+        pageLabel.frame = NSRect(x: 188, y: 7, width: 50, height: 20)
+        addSubview(pageLabel)
+
         nextPageButton = NSButton(title: "›", target: self, action: #selector(goToNextPage))
         nextPageButton.bezelStyle = .texturedRounded
-        nextPageButton.font = .systemFont(ofSize: 14, weight: .bold)
-        nextPageButton.frame = NSRect(x: bounds.width - 68, y: 6, width: 24, height: 24)
-        nextPageButton.autoresizingMask = [.minXMargin]
-        headerBar.addSubview(nextPageButton)
+        nextPageButton.isBordered = false
+        nextPageButton.font = .systemFont(ofSize: 15, weight: .bold)
+        nextPageButton.contentTintColor = .white
+        nextPageButton.frame = NSRect(x: 238, y: 5, width: 20, height: 24)
+        addSubview(nextPageButton)
 
-        // Delete Button
-        deleteButton = NSButton(image: NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Remove PDF") ?? NSImage(), target: self, action: #selector(deletePDF))
+        // Separator
+        let sep = NSBox(frame: NSRect(x: 264, y: 8, width: 1, height: 18))
+        sep.boxType = .custom
+        sep.borderWidth = 0
+        sep.fillColor = NSColor(white: 1.0, alpha: 0.20)
+        addSubview(sep)
+
+        // 4. Delete Button
+        deleteButton = NSButton(
+            image: NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Remove PDF") ?? NSImage(),
+            target: self,
+            action: #selector(deletePDF)
+        )
         deleteButton.bezelStyle = .texturedRounded
         deleteButton.isBordered = false
-        deleteButton.contentTintColor = .secondaryLabelColor
-        deleteButton.frame = NSRect(x: bounds.width - 34, y: 6, width: 24, height: 24)
-        deleteButton.autoresizingMask = [.minXMargin]
-        headerBar.addSubview(deleteButton)
-
-        // 2. Native PDFKit View
-        let pdfFrame = NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height - 36)
-        pdfView = PDFView(frame: pdfFrame)
-        pdfView.autoresizingMask = [.width, .height]
-        pdfView.autoScales = true
-        pdfView.displayMode = .singlePage
-        pdfView.displayDirection = .vertical
-        pdfView.displaysPageBreaks = false
-        pdfView.backgroundColor = .white
-        addSubview(pdfView)
-
-        NotificationCenter.default.addObserver(self, selector: #selector(pdfPageChanged), name: .PDFViewPageChanged, object: pdfView)
+        deleteButton.contentTintColor = NSColor(white: 0.70, alpha: 1.0)
+        deleteButton.frame = NSRect(x: 271, y: 7, width: 20, height: 20)
+        addSubview(deleteButton)
     }
 
-    private func loadPDF() {
-        if let doc = embeddedPDF.makePDFDocument() {
-            pdfView.document = doc
-            embeddedPDF.pageCount = doc.pageCount
-            if embeddedPDF.currentPage < doc.pageCount, let page = doc.page(at: embeddedPDF.currentPage) {
-                pdfView.go(to: page)
-            }
-            updatePaginationUI()
-        }
-    }
-
-    private func updatePaginationUI() {
-        guard let doc = pdfView.document else { return }
-        let current = doc.index(for: pdfView.currentPage ?? doc.page(at: 0)!) + 1
-        let total = max(1, doc.pageCount)
+    public func updatePaginationUI() {
+        let current = embeddedPDF.currentPage + 1
+        let total = max(1, embeddedPDF.pageCount)
         pageLabel.stringValue = "\(current) / \(total)"
         prevPageButton.isEnabled = current > 1
         nextPageButton.isEnabled = current < total
+        prevPageButton.alphaValue = current > 1 ? 1.0 : 0.35
+        nextPageButton.alphaValue = current < total ? 1.0 : 0.35
     }
 
     @objc private func goToPrevPage() {
-        if pdfView.canGoToPreviousPage {
-            pdfView.goToPreviousPage(nil)
-            if let page = pdfView.currentPage, let doc = pdfView.document {
-                embeddedPDF.currentPage = doc.index(for: page)
-                delegate?.pdfItemDidUpdateFrame(embeddedPDF)
-            }
+        if embeddedPDF.currentPage > 0 {
+            embeddedPDF.currentPage -= 1
+            updatePaginationUI()
+            delegate?.pdfItemDidUpdateFrame(embeddedPDF)
         }
     }
 
     @objc private func goToNextPage() {
-        if pdfView.canGoToNextPage {
-            pdfView.goToNextPage(nil)
-            if let page = pdfView.currentPage, let doc = pdfView.document {
-                embeddedPDF.currentPage = doc.index(for: page)
-                delegate?.pdfItemDidUpdateFrame(embeddedPDF)
-            }
+        if embeddedPDF.currentPage < embeddedPDF.pageCount - 1 {
+            embeddedPDF.currentPage += 1
+            updatePaginationUI()
+            delegate?.pdfItemDidUpdateFrame(embeddedPDF)
         }
     }
 
@@ -152,28 +133,19 @@ public final class PDFCanvasItemView: NSView {
         delegate?.pdfItemDidRequestDelete(embeddedPDF)
     }
 
-    @objc private func pdfPageChanged() {
-        updatePaginationUI()
-    }
-
-    // Drag header to move PDF on infinite canvas
+    // Drag capsule to move PDF on infinite canvas
     public override func mouseDown(with event: NSEvent) {
-        let loc = convert(event.locationInWindow, from: nil)
-        if headerBar.frame.contains(loc) {
-            isDragging = true
-            dragStartMouse = event.locationInWindow
-            dragStartOrigin = embeddedPDF.origin
-            return
-        }
-        super.mouseDown(with: event)
+        isDragging = true
+        dragStartMouse = event.locationInWindow
+        dragStartOrigin = embeddedPDF.origin
     }
 
     public override func mouseDragged(with event: NSEvent) {
         if isDragging {
-            let deltaX = event.locationInWindow.x - dragStartMouse.x
-            let deltaY = event.locationInWindow.y - dragStartMouse.y
+            let zoom = delegate?.pdfItemCurrentZoomScale() ?? 1.0
+            let deltaX = (event.locationInWindow.x - dragStartMouse.x) / zoom
+            let deltaY = (event.locationInWindow.y - dragStartMouse.y) / zoom
             embeddedPDF.origin = CGPoint(x: dragStartOrigin.x + deltaX, y: dragStartOrigin.y + deltaY)
-            frame = embeddedPDF.frame
             delegate?.pdfItemDidUpdateFrame(embeddedPDF)
             return
         }
@@ -184,10 +156,5 @@ public final class PDFCanvasItemView: NSView {
         isDragging = false
         super.mouseUp(with: event)
     }
-
-    public func setSelected(_ selected: Bool) {
-        self.isSelected = selected
-        layer?.borderColor = selected ? NSColor.systemBlue.cgColor : NSColor(white: 0.8, alpha: 1.0).cgColor
-        layer?.borderWidth = selected ? 2.5 : 1.0
-    }
 }
+

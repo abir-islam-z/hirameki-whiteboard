@@ -29,6 +29,7 @@ private enum TransformMode: Equatable {
     case none
     case moving
     case resizing(handle: ResizeHandle, anchor: CGPoint, initialBounds: CGRect)
+    case movingPDF(initialOrigin: CGPoint)
 }
 
 public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFieldDelegate, FreeformWhiteboardActionDelegate {
@@ -82,6 +83,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     private var currentStroke: Stroke?
     private var redoStack: [Stroke] = []
     public var selectedStrokeIndex: Int?
+    public var selectedPDFIndex: Int?
 
     // Interactive Transformation
     private var transformMode: TransformMode = .none
@@ -201,28 +203,9 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
     }
 
     public override func hitTest(_ point: NSPoint) -> NSView? {
-        // Forward touches to bottom left bar if clicked inside
-        if let bl = freeformBottomLeftHost, bl.frame.contains(point) {
-            let local = convert(point, to: bl)
-            return bl.hitTest(local)
+        if let hit = super.hitTest(point), hit != self {
+            return hit
         }
-        // Forward touches to page bar if clicked inside
-        if let pHost = pageBarHost, pHost.frame.contains(point) {
-            let local = convert(point, to: pHost)
-            return pHost.hitTest(local)
-        }
-        // Forward to active text editor if active
-        if let editor = activeTextField, editor.frame.contains(point) {
-            return editor
-        }
-        // Forward to PDF items if clicked inside
-        for (_, pdfView) in pdfItemViews {
-            if pdfView.frame.contains(point) {
-                let local = convert(point, to: pdfView)
-                return pdfView.hitTest(local)
-            }
-        }
-        // All other canvas points return self directly
         return self
     }
 
@@ -311,7 +294,11 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         let screenY = (p.y * zoomScale) + panOffset.y
         let screenW = view.embeddedPDF.width * zoomScale
         let screenH = view.embeddedPDF.height * zoomScale
-        view.frame = NSRect(x: screenX, y: screenY, width: screenW, height: screenH)
+        let pillW: CGFloat = 300
+        let pillH: CGFloat = 34
+        let pillX = screenX + (screenW - pillW) / 2.0
+        let pillY = screenY + screenH + 8
+        view.frame = NSRect(x: pillX, y: pillY, width: pillW, height: pillH)
     }
 
     private func updateTransform() {
@@ -325,6 +312,8 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         if let idx = document.activePage.embeddedPDFs.firstIndex(where: { $0.id == item.id }) {
             document.activePage.embeddedPDFs[idx] = item
             canvasDelegate?.canvasDidUpdateDocument(document)
+            updateTransform()
+            needsDisplay = true
         }
     }
 
@@ -333,9 +322,16 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             document.activePage.embeddedPDFs.remove(at: idx)
             pdfItemViews[item.id]?.removeFromSuperview()
             pdfItemViews.removeValue(forKey: item.id)
+            if selectedPDFIndex == idx {
+                selectedPDFIndex = nil
+            }
             canvasDelegate?.canvasDidUpdateDocument(document)
             needsDisplay = true
         }
+    }
+
+    public func pdfItemCurrentZoomScale() -> CGFloat {
+        return zoomScale
     }
 
     // MARK: - Insert PDF File
@@ -343,18 +339,22 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         guard let data = try? Data(contentsOf: url) else { return }
         guard let doc = PDFDocument(data: data) else { return }
 
-        let targetPoint = canvasPoint ?? canvasPointFromScreen(CGPoint(x: bounds.midX, y: bounds.midY))
-        let initialWidth: CGFloat = 650
         let pageBox = doc.page(at: 0)?.bounds(for: .mediaBox) ?? CGRect(x: 0, y: 0, width: 612, height: 792)
         let aspect = pageBox.height / max(1, pageBox.width)
-        let initialHeight = initialWidth * aspect
+
+        let maxW = min(560.0, max(380.0, bounds.width * 0.50))
+        let maxH = min(max(300.0, bounds.height - 190.0), maxW * aspect)
+        let finalW = maxH / aspect
+        let finalH = maxH
+
+        let targetPoint = canvasPoint ?? canvasPointFromScreen(CGPoint(x: bounds.midX, y: (bounds.height - 40.0) / 2.0))
 
         let emb = EmbeddedPDF(
             title: url.lastPathComponent,
             pdfData: data,
-            origin: CGPoint(x: targetPoint.x - initialWidth / 2, y: targetPoint.y - initialHeight / 2),
-            width: initialWidth,
-            height: initialHeight,
+            origin: CGPoint(x: targetPoint.x - finalW / 2.0, y: targetPoint.y - finalH / 2.0),
+            width: finalW,
+            height: finalH,
             currentPage: 0,
             pageCount: doc.pageCount
         )
@@ -400,7 +400,10 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         ctx.translateBy(x: panOffset.x, y: panOffset.y)
         ctx.scaleBy(x: zoomScale, y: zoomScale)
 
-        // Draw Completed Page Strokes
+        // Draw Embedded PDFs directly on canvas (crisp vector pages, zero scrollbars)
+        drawEmbeddedPDFs(in: ctx)
+
+        // Draw Completed Page Strokes (annotations, highlighters, shapes, notes)
         for (idx, stroke) in document.activePage.strokes.enumerated() {
             if idx == editingStrokeIndex { continue }
             drawStroke(stroke, in: ctx, isSelected: idx == selectedStrokeIndex)
@@ -471,6 +474,69 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         while y < bounds.height {
             ctx.strokeLineSegments(between: [CGPoint(x: 0, y: y), CGPoint(x: bounds.width, y: y)])
             y += gridSpacing
+        }
+    }
+
+    private func drawEmbeddedPDFs(in ctx: CGContext) {
+        for (pIdx, emb) in document.activePage.embeddedPDFs.enumerated() {
+            let pdfRect = CGRect(x: emb.originX, y: emb.originY, width: emb.width, height: emb.height)
+            let cornerRadius: CGFloat = 4.0
+
+            // 1. Soft realistic drop shadow under PDF paper sheet
+            ctx.saveGState()
+            ctx.setShadow(
+                offset: CGSize(width: 0, height: -4.0 / zoomScale),
+                blur: 14.0 / zoomScale,
+                color: NSColor.black.withAlphaComponent(0.16).cgColor
+            )
+            ctx.setFillColor(NSColor.white.cgColor)
+            let shadowPath = CGPath(roundedRect: pdfRect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+            ctx.addPath(shadowPath)
+            ctx.fillPath()
+            ctx.restoreGState()
+
+            // 2. Render crisp vector PDF Page directly into graphics context
+            ctx.saveGState()
+            let clipPath = CGPath(roundedRect: pdfRect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+            ctx.addPath(clipPath)
+            ctx.clip()
+
+            // White paper sheet background
+            ctx.setFillColor(NSColor.white.cgColor)
+            ctx.fill(pdfRect)
+
+            if let doc = emb.makePDFDocument(), let pdfPage = doc.page(at: emb.currentPage) {
+                ctx.saveGState()
+                let pageBox = pdfPage.bounds(for: .mediaBox)
+                ctx.translateBy(x: emb.originX, y: emb.originY)
+                let scaleX = emb.width / max(1, pageBox.width)
+                let scaleY = emb.height / max(1, pageBox.height)
+                ctx.scaleBy(x: scaleX, y: scaleY)
+                ctx.translateBy(x: -pageBox.origin.x, y: -pageBox.origin.y)
+                pdfPage.draw(with: .mediaBox, to: ctx)
+                ctx.restoreGState()
+            }
+            ctx.restoreGState()
+
+            // 3. Crisp subtle paper border
+            ctx.saveGState()
+            ctx.setStrokeColor(NSColor(white: 0.85, alpha: 1.0).cgColor)
+            ctx.setLineWidth(1.0 / zoomScale)
+            let borderPath = CGPath(roundedRect: pdfRect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+            ctx.addPath(borderPath)
+            ctx.strokePath()
+            ctx.restoreGState()
+
+            // 4. Selection Highlight if selected with .select tool
+            if activeTool == .select && selectedPDFIndex == pIdx {
+                ctx.saveGState()
+                ctx.setStrokeColor(NSColor.systemBlue.cgColor)
+                ctx.setLineWidth(2.5 / zoomScale)
+                let selPath = CGPath(roundedRect: pdfRect.insetBy(dx: -2 / zoomScale, dy: -2 / zoomScale), cornerWidth: cornerRadius + 2, cornerHeight: cornerRadius + 2, transform: nil)
+                ctx.addPath(selPath)
+                ctx.strokePath()
+                ctx.restoreGState()
+            }
         }
     }
 
@@ -707,8 +773,19 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             return
         }
 
-        if activeTool == .select, let selIdx = selectedStrokeIndex, selIdx < document.activePage.strokes.count {
-            switch transformMode {
+        if activeTool == .select {
+            if case .movingPDF(let initOrigin) = transformMode, let pIdx = selectedPDFIndex, pIdx < document.activePage.embeddedPDFs.count {
+                let deltaX = canvasPt.x - dragStartPos.x
+                let deltaY = canvasPt.y - dragStartPos.y
+                document.activePage.embeddedPDFs[pIdx].origin = CGPoint(x: initOrigin.x + deltaX, y: initOrigin.y + deltaY)
+                updateTransform()
+                hasMovedSignificantly = true
+                needsDisplay = true
+                return
+            }
+
+            if let selIdx = selectedStrokeIndex, selIdx < document.activePage.strokes.count {
+                switch transformMode {
             case .moving:
                 let deltaX = canvasPt.x - dragStartPos.x
                 let deltaY = canvasPt.y - dragStartPos.y
@@ -761,10 +838,11 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
                 needsDisplay = true
                 return
 
-            case .none:
+            case .none, .movingPDF:
                 break
             }
         }
+    }
 
         if activeTool == .eraser {
             eraseAt(canvasPt)
@@ -875,6 +953,7 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
         for (idx, stroke) in document.activePage.strokes.enumerated().reversed() {
             if stroke.hitTest(canvasPt, tolerance: 12.0) {
                 selectedStrokeIndex = idx
+                selectedPDFIndex = nil
                 if clickCount == 2 && (stroke.tool == .text || stroke.tool == .note) {
                     startTextEditor(for: stroke, at: idx)
                     return
@@ -888,12 +967,27 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
             }
         }
 
-        // 3. Clicked empty space
+        // 3. Click on any PDF to select or drag it
+        for (pIdx, emb) in document.activePage.embeddedPDFs.enumerated().reversed() {
+            let pdfRect = CGRect(x: emb.originX, y: emb.originY, width: emb.width, height: emb.height)
+            if pdfRect.contains(canvasPt) {
+                selectedPDFIndex = pIdx
+                selectedStrokeIndex = nil
+                transformMode = .movingPDF(initialOrigin: emb.origin)
+                dragStartPos = canvasPt
+                hasMovedSignificantly = false
+                needsDisplay = true
+                return
+            }
+        }
+
+        // 4. Clicked empty space
         clearSelection()
     }
 
     public func clearSelection() {
         selectedStrokeIndex = nil
+        selectedPDFIndex = nil
         transformMode = .none
         needsDisplay = true
     }
@@ -1223,6 +1317,12 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, NSTextFi
                 selectedStrokeIndex = nil
                 canvasDelegate?.canvasDidUpdateDocument(document)
                 needsDisplay = true
+                return
+            }
+            if let pIdx = selectedPDFIndex, pIdx < document.activePage.embeddedPDFs.count {
+                let emb = document.activePage.embeddedPDFs[pIdx]
+                pdfItemDidRequestDelete(emb)
+                selectedPDFIndex = nil
                 return
             }
         }
