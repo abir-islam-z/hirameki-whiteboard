@@ -342,12 +342,15 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
         let screenX = (p.x * zoomScale) + panOffset.x
         let screenY = (p.y * zoomScale) + panOffset.y
         let screenW = view.embeddedPDF.width * zoomScale
-        let screenH = view.embeddedPDF.height * zoomScale
-        let pillW: CGFloat = 300
-        let pillH: CGFloat = 34
-        let pillX = screenX + (screenW - pillW) / 2.0
-        let pillY = screenY + screenH + 8
-        view.frame = NSRect(x: pillX, y: pillY, width: pillW, height: pillH)
+        let inset: CGFloat = 8
+        let barH = PDFCanvasItemView.barHeight
+        // Inset 8px from left/right edges, 8px from the bottom edge — sits inside the element
+        view.frame = NSRect(
+            x: screenX + inset,
+            y: screenY + inset,
+            width: max(120, screenW - inset * 2),
+            height: barH
+        )
     }
 
     private func layoutImageItem(_ view: ImageCanvasItemView) {
@@ -355,12 +358,15 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
         let screenX = (p.x * zoomScale) + panOffset.x
         let screenY = (p.y * zoomScale) + panOffset.y
         let screenW = view.embeddedImage.width * zoomScale
-        let screenH = view.embeddedImage.height * zoomScale
-        let pillW: CGFloat = 220
-        let pillH: CGFloat = 32
-        let pillX = screenX + (screenW - pillW) / 2.0
-        let pillY = screenY + screenH + 8
-        view.frame = NSRect(x: pillX, y: pillY, width: pillW, height: pillH)
+        let inset: CGFloat = 8
+        let barH = ImageCanvasItemView.barHeight
+        // Inset 8px from left/right edges, 8px from the bottom edge — sits inside the element
+        view.frame = NSRect(
+            x: screenX + inset,
+            y: screenY + inset,
+            width: max(120, screenW - inset * 2),
+            height: barH
+        )
     }
 
     private func updateTransform() {
