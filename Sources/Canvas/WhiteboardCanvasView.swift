@@ -157,6 +157,14 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
     public override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
         let screenPt = convert(event.locationInWindow, from: nil)
+        let toolbarHeight: CGFloat = 54.0
+        if screenPt.y >= bounds.height - toolbarHeight {
+            if currentCursorPoint != nil {
+                currentCursorPoint = nil
+                needsDisplay = true
+            }
+            return
+        }
         currentCursorPoint = screenPt
         if activeTool == .eraser {
             needsDisplay = true
@@ -270,6 +278,10 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
     public override func hitTest(_ point: NSPoint) -> NSView? {
         if let hit = super.hitTest(point), hit != self {
             return hit
+        }
+        let toolbarHeight: CGFloat = 54.0
+        if point.y >= bounds.height - toolbarHeight {
+            return nil
         }
         return self
     }
@@ -960,8 +972,12 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
 
     // MARK: - Mouse Events
     public override func mouseDown(with event: NSEvent) {
-        commitActiveTextEditor()
         let screenPt = convert(event.locationInWindow, from: nil)
+        let toolbarHeight: CGFloat = 54.0
+        if screenPt.y >= bounds.height - toolbarHeight {
+            return
+        }
+        commitActiveTextEditor()
         let canvasPt = canvasPointFromScreen(screenPt)
 
         if activeTool == .hand || isSpacebarPanActive || event.buttonNumber == 2 {
@@ -1951,7 +1967,9 @@ public final class WhiteboardCanvasView: NSView, PDFCanvasItemDelegate, ImageCan
         case .note: cursor = .pointingHand
         default: cursor = .crosshair
         }
-        addCursorRect(bounds, cursor: cursor)
+        let toolbarHeight: CGFloat = 54.0
+        let canvasRect = CGRect(x: 0, y: 0, width: bounds.width, height: max(0, bounds.height - toolbarHeight))
+        addCursorRect(canvasRect, cursor: cursor)
     }
 
     // MARK: - FreeformWhiteboardActionDelegate
